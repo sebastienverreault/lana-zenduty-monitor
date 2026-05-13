@@ -7,11 +7,46 @@ The monitor keeps durable state in SQLite, writes a GNOME-readable `status.json`
 ## Quick Start
 
 ```sh
+cd ~/source/repos/lana-zenduty-monitor
 make init
-make poll
 make install-gnome-extension
 make enable-gnome-extension
 make enable-user-service
+```
+
+Start the background monitor and check that the timer is active:
+
+```sh
+make enable-user-service
+systemctl --user status lana-zenduty-monitor.timer
+systemctl --user list-timers lana-zenduty-monitor.timer
+```
+
+Run one poll immediately:
+
+```sh
+systemctl --user start lana-zenduty-monitor.service
+```
+
+Check status from the command line:
+
+```sh
+make status
+systemctl --user status lana-zenduty-monitor.service
+```
+
+Watch monitor logs:
+
+```sh
+journalctl --user -u lana-zenduty-monitor.service -f
+```
+
+Open the details UI and inspect runtime files:
+
+```sh
+make details
+ls -la ~/.local/state/lana-zenduty-monitor
+ls -la ~/.local/state/lana-zenduty-monitor/logs
 ```
 
 The default assignee filter is `a7eecf16-e8fa-4903-90ea-8`.
