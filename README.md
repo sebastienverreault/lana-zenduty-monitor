@@ -31,6 +31,7 @@ Runtime files live in `~/.local/state/lana-zenduty-monitor/`:
 
 - `monitor.db`: incident and run state
 - `status.json`: current state for the GNOME extension
+- `details.html`: local details UI opened from the GNOME extension
 - `logs/`: Codex poll and triage transcripts
 
 ## Commands
@@ -40,11 +41,23 @@ make poll
 make daemon
 make triage INCIDENT_ID=<zenduty-unique-id>
 make status
+make details
 ```
 
 `make poll` asks Codex to use Drua from the Lana Bank checkout and return machine-readable JSON. Newly seen incidents are stored and optionally triaged.
 
 `make triage` asks Codex to use the `lana-alert-fixer` workflow, inspect Zenduty/Honeycomb/code, and write a summary. The default prompt forbids auto-resolution.
+
+## Details UI
+
+The GNOME extension popup shows current counts, up to eight open incidents, and actions:
+
+- `Open details`: opens `~/.local/state/lana-zenduty-monitor/details.html`
+- `Open logs`: opens the transcript directory
+- `Open status file`: opens the raw status JSON
+- `Refresh now`: starts the systemd user service once
+
+Incident rows open their triage log when available, otherwise the details page.
 
 ## systemd User Timer
 

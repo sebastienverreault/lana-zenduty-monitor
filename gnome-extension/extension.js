@@ -19,6 +19,20 @@ class LanaZendutyIndicator extends PanelMenu.Button {
             'lana-zenduty-monitor',
             'status.json',
         ]);
+        this._detailsPath = GLib.build_filenamev([
+            GLib.get_home_dir(),
+            '.local',
+            'state',
+            'lana-zenduty-monitor',
+            'details.html',
+        ]);
+        this._logsPath = GLib.build_filenamev([
+            GLib.get_home_dir(),
+            '.local',
+            'state',
+            'lana-zenduty-monitor',
+            'logs',
+        ]);
 
         this._icon = new St.Icon({
             icon_name: 'emblem-ok-symbolic',
@@ -35,11 +49,23 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._incidentSection);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const openDetails = new PopupMenu.PopupMenuItem('Open details');
+        openDetails.connect('activate', () => this._openPath(this._detailsPath));
+        this.menu.addMenuItem(openDetails);
+
+        const openLogs = new PopupMenu.PopupMenuItem('Open logs');
+        openLogs.connect('activate', () => this._openPath(this._logsPath));
+        this.menu.addMenuItem(openLogs);
+
         const openStatus = new PopupMenu.PopupMenuItem('Open status file');
-        openStatus.connect('activate', () => {
-            GLib.spawn_command_line_async(`xdg-open ${this._statusPath}`);
-        });
+        openStatus.connect('activate', () => this._openPath(this._statusPath));
         this.menu.addMenuItem(openStatus);
+
+        const refreshNow = new PopupMenu.PopupMenuItem('Refresh now');
+        refreshNow.connect('activate', () => {
+            GLib.spawn_command_line_async('systemctl --user start lana-zenduty-monitor.service');
+        });
+        this.menu.addMenuItem(refreshNow);
 
         this._refresh();
         this._timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 15, () => {
@@ -71,6 +97,10 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         } catch (error) {
             return {color: 'gray', error: String(error), counts: {}, incidents: []};
         }
+    }
+
+    _openPath(path) {
+        GLib.spawn_command_line_async(`xdg-open ${GLib.shell_quote(path)}`);
     }
 
     _applyStatus(status) {
@@ -111,9 +141,18 @@ class LanaZendutyIndicator extends PanelMenu.Button {
             const number = incident.incident_number || '?';
             const state = incident.status || '?';
             const title = (incident.title || '').replace(/\s+/g, ' ').slice(0, 90);
-            this._incidentSection.addMenuItem(new PopupMenu.PopupMenuItem(`#${number} ${state}: ${title}`, {
-                reactive: false,
-            }));
+            const row = new PopupMenu.PopupMenuItem(`#${number} ${state}: ${title}`);
+            row.connect('activate', () => {
+                this._openPath(incident.triage_log_path || this._detailsPath);
+            });
+            this._incidentSection.addMenuItem(row);
+
+            const created = incident.creation_date || 'unknown time';
+            const triage = incident.triage_status || 'pending';
+            this._incidentSection.addMenuItem(new PopupMenu.PopupMenuItem(
+                `  created ${created} · triage ${triage}`,
+                {reactive: false}
+            ));
         }
     }
 });

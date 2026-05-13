@@ -5,7 +5,7 @@ SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 GNOME_EXT_UUID := lana-zenduty-monitor@galoy.io
 GNOME_EXT_DIR := $(HOME)/.local/share/gnome-shell/extensions/$(GNOME_EXT_UUID)
 
-.PHONY: help init poll daemon triage test install-user-service enable-user-service disable-user-service install-gnome-extension enable-gnome-extension status clean-state
+.PHONY: help init poll daemon triage test install-user-service enable-user-service disable-user-service install-gnome-extension enable-gnome-extension status details clean-state
 
 help:
 	@printf '%s\n' \
@@ -14,6 +14,7 @@ help:
 		'  make poll                    Run one monitor poll via Codex' \
 		'  make daemon                  Run polling loop in foreground' \
 		'  make triage INCIDENT_ID=...  Run Codex investigation for one incident' \
+		'  make details                 Open generated details HTML page' \
 		'  make test                    Compile Python and validate extension JSON' \
 		'  make install-user-service    Install systemd user service/timer' \
 		'  make enable-user-service     Enable and start systemd user timer' \
@@ -64,6 +65,9 @@ enable-gnome-extension: install-gnome-extension
 
 status:
 	python3 -m lana_zenduty_monitor status
+
+details: init
+	xdg-open "$(STATE_DIR)/details.html"
 
 clean-state:
 	rm -rf "$(STATE_DIR)"
