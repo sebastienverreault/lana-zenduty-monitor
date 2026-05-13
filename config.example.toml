@@ -1,6 +1,6 @@
 [monitor]
-lana_bank_dir = "/home/sebver/source/repos/lana-bank"
-state_dir = "/home/sebver/.local/state/lana-zenduty-monitor"
+lana_bank_dir = "~/source/repos/lana-bank"
+state_dir = "~/.local/state/lana-zenduty-monitor"
 poll_interval_seconds = 300
 codex_timeout_seconds = 600
 gh_timeout_seconds = 120
