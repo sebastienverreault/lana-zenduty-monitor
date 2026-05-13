@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
@@ -46,28 +47,21 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         this._dismissedAttentionKey = null;
         const extensionPath = this._extension.path ||
             (this._extension.dir ? this._extension.dir.get_path() : '.');
-        this._zendutyIconPath = GLib.build_filenamev([
-            extensionPath,
-            'zenduty.svg',
-        ]);
+        this._zendutyIconPaths = {
+            green: GLib.build_filenamev([extensionPath, 'zenduty-green.svg']),
+            yellow: GLib.build_filenamev([extensionPath, 'zenduty-yellow.svg']),
+            red: GLib.build_filenamev([extensionPath, 'zenduty-red.svg']),
+            gray: GLib.build_filenamev([extensionPath, 'zenduty-gray.svg']),
+        };
 
-        this._iconWrap = new St.Bin({
-            width: 22,
-            height: 22,
-            style: [
-                `background-image: url("${GLib.filename_to_uri(this._zendutyIconPath, null)}");`,
-                'background-size: contain;',
-                'background-repeat: no-repeat;',
-                'background-position: center;',
-                'padding: 2px;',
-            ].join(' '),
-        });
         this._icon = new St.Icon({
-            icon_name: 'emblem-ok-symbolic',
+            gicon: new Gio.FileIcon({
+                file: Gio.File.new_for_path(this._zendutyIconPaths.gray),
+            }),
+            icon_size: 18,
             style_class: 'system-status-icon',
         });
-        this._iconWrap.set_child(this._icon);
-        this.add_child(this._iconWrap);
+        this.add_child(this._icon);
 
         this._summaryItem = new PopupMenu.PopupMenuItem('LANA Zenduty: loading', {
             reactive: false,
@@ -163,6 +157,14 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         });
     }
 
+    _setIconColor(color) {
+        const iconColor = color === 'red' || color === 'yellow' ? color :
+            color === 'green' || color === 'blue' ? 'green' : 'gray';
+        this._icon.gicon = new Gio.FileIcon({
+            file: Gio.File.new_for_path(this._zendutyIconPaths[iconColor]),
+        });
+    }
+
     _applyStatus(status) {
         const color = status.color || 'gray';
         const counts = status.counts || {};
@@ -172,22 +174,7 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         const dependabotOpen = counts.dependabot_open || 0;
         const concourseFailed = counts.concourse_failed || 0;
 
-        if (color === 'red') {
-            this._icon.icon_name = 'dialog-warning-symbolic';
-            this._icon.style = 'color: #e01b24;';
-        } else if (color === 'yellow') {
-            this._icon.icon_name = 'dialog-warning-symbolic';
-            this._icon.style = 'color: #f6d32d;';
-        } else if (color === 'blue') {
-            this._icon.icon_name = 'software-update-available-symbolic';
-            this._icon.style = 'color: #62a0ea;';
-        } else if (color === 'green') {
-            this._icon.icon_name = 'emblem-ok-symbolic';
-            this._icon.style = 'color: #33d17a;';
-        } else {
-            this._icon.icon_name = 'dialog-question-symbolic';
-            this._icon.style = 'color: #9a9996;';
-        }
+        this._setIconColor(color);
 
         const updated = status.updated_at || 'never';
         const error = status.error ? ` error: ${status.error}` : '';

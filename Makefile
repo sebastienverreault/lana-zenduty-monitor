@@ -59,7 +59,7 @@ disable-user-service:
 
 install-gnome-extension:
 	mkdir -p "$(GNOME_EXT_DIR)"
-	cp gnome-extension/metadata.json gnome-extension/extension.js gnome-extension/zenduty.svg "$(GNOME_EXT_DIR)/"
+	cp gnome-extension/metadata.json gnome-extension/extension.js gnome-extension/zenduty*.svg "$(GNOME_EXT_DIR)/"
 
 enable-gnome-extension: install-gnome-extension
 	gnome-extensions enable "$(GNOME_EXT_UUID)"
