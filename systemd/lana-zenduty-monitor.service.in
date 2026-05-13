@@ -1,0 +1,7 @@
+[Unit]
+Description=LANA Zenduty monitor poll
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_DIR@
+ExecStart=/usr/bin/env zsh -lc 'cd @REPO_DIR@ && python3 -m lana_zenduty_monitor poll'

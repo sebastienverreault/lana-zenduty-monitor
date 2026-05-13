@@ -1,0 +1,8 @@
+{
+  "uuid": "lana-zenduty-monitor@galoy.io",
+  "name": "LANA Zenduty Monitor",
+  "description": "Panel indicator for LANA Zenduty monitor status",
+  "shell-version": ["45", "46", "47", "48"],
+  "url": "https://github.com/galoy/lana-zenduty-monitor",
+  "version": 1
+}

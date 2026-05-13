@@ -1,0 +1,11 @@
+[Unit]
+Description=Run LANA Zenduty monitor periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

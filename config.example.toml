@@ -1,0 +1,18 @@
+[monitor]
+lana_bank_dir = "/home/sebver/source/repos/lana-bank"
+state_dir = "/home/sebver/.local/state/lana-zenduty-monitor"
+poll_interval_seconds = 300
+codex_timeout_seconds = 600
+triage_new_incidents = true
+
+# Filter incidents by Zenduty assigned_to. Empty string disables assignee filtering.
+assignee_user_id = "a7eecf16-e8fa-4903-90ea-8"
+
+[codex]
+command = "codex"
+model = ""
+sandbox = "danger-full-access"
+
+# Extra args are appended before the prompt.
+extra_args = []
+
