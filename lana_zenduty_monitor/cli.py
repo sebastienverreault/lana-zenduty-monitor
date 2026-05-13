@@ -12,7 +12,7 @@ import textwrap
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,10 @@ ASSIGNEE_ALIASES_ENV = "LANA_ZENDUTY_ASSIGNEE_ALIASES"
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "lana-zenduty-monitor" / "config.toml"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "lana-zenduty-monitor"
 DEFAULT_LANA_BANK_DIR = Path.home() / "source" / "repos" / "lana-bank"
+DEFAULT_DEPENDABOT_REPO = "GaloyMoney/lana-bank"
+DEFAULT_CONCOURSE_URL = "https://ci.galoy.io"
+CONCOURSE_FAILURE_STATUSES = {"failed", "errored", "aborted"}
+SUCCESSFUL_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,11 @@ class MonitorConfig:
     triage_new_incidents: bool = True
     assignee_user_id: tuple[str, ...] = ()
     assignee_aliases: dict[str, str] | None = None
+    dependabot_repo: str = DEFAULT_DEPENDABOT_REPO
+    dependabot_pr_limit: int = 50
+    concourse_url: str = DEFAULT_CONCOURSE_URL
+    concourse_failure_limit: int = 20
+    gh_timeout_seconds: int = 120
     codex: CodexConfig = CodexConfig()
 
     def __post_init__(self) -> None:
@@ -96,6 +105,44 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def parse_utc(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def concourse_snooze_path(config: MonitorConfig) -> Path:
+    return config.state_dir / "concourse-snooze.json"
+
+
+def read_concourse_snooze(config: MonitorConfig) -> dict[str, Any]:
+    path = concourse_snooze_path(config)
+    if not path.exists():
+        return {"active": False, "until": None}
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return {"active": False, "until": None}
+    until = parse_utc(data.get("until"))
+    active = bool(until and until > datetime.now(timezone.utc))
+    return {"active": active, "until": data.get("until") if until else None}
+
+
+def set_concourse_snooze(config: MonitorConfig, minutes: int) -> dict[str, Any]:
+    until = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=minutes)
+    snooze = {"active": True, "until": until.isoformat().replace("+00:00", "Z")}
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    concourse_snooze_path(config).write_text(json.dumps(snooze, indent=2, sort_keys=True))
+    return snooze
+
+
+def clear_concourse_snooze(config: MonitorConfig) -> None:
+    concourse_snooze_path(config).unlink(missing_ok=True)
+
+
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MonitorConfig:
     data: dict[str, Any] = {}
     if path.exists():
@@ -112,6 +159,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MonitorConfig:
         triage_new_incidents=bool(monitor.get("triage_new_incidents", True)),
         assignee_user_id=parse_assignee_user_ids(monitor.get("assignee_user_id")),
         assignee_aliases=parse_assignee_aliases(monitor.get("assignee_aliases")),
+        dependabot_repo=str(monitor.get("dependabot_repo", DEFAULT_DEPENDABOT_REPO)),
+        dependabot_pr_limit=int(monitor.get("dependabot_pr_limit", 50)),
+        concourse_url=str(monitor.get("concourse_url", DEFAULT_CONCOURSE_URL)).rstrip("/"),
+        concourse_failure_limit=int(monitor.get("concourse_failure_limit", 20)),
+        gh_timeout_seconds=int(monitor.get("gh_timeout_seconds", 120)),
         codex=CodexConfig(
             command=str(codex.get("command", "codex")),
             model=str(codex.get("model", "")),
@@ -249,7 +301,17 @@ class Store:
         row = self.conn.execute(
             "select * from incidents where unique_id = ?", (unique_id,)
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        incident = dict(row)
+        try:
+            raw = json.loads(incident.get("raw_json") or "{}")
+            if isinstance(raw, dict):
+                raw.update(incident)
+                return raw
+        except json.JSONDecodeError:
+            pass
+        return incident
 
     def enrich_incidents(self, incidents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         enriched: list[dict[str, Any]] = []
@@ -381,6 +443,123 @@ def add_assignee_aliases(config: MonitorConfig, incidents: list[dict[str, Any]])
     return enriched
 
 
+def check_counts(checks: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"total": len(checks), "success": 0, "pending": 0, "failure": 0}
+    for check in checks:
+        status = str(check.get("status", "")).upper()
+        conclusion = str(check.get("conclusion", "")).upper()
+        if status != "COMPLETED":
+            counts["pending"] += 1
+        elif conclusion in SUCCESSFUL_CHECK_CONCLUSIONS:
+            counts["success"] += 1
+        else:
+            counts["failure"] += 1
+    return counts
+
+
+def normalize_dependabot_pr(raw: dict[str, Any]) -> dict[str, Any]:
+    checks = raw.get("statusCheckRollup")
+    if not isinstance(checks, list):
+        checks = []
+    counts = check_counts([check for check in checks if isinstance(check, dict)])
+    checks_successful = counts["total"] > 0 and counts["pending"] == 0 and counts["failure"] == 0
+    ready = checks_successful and not bool(raw.get("isDraft"))
+    return {
+        "number": raw.get("number"),
+        "title": str(raw.get("title", "")),
+        "url": raw.get("url"),
+        "updated_at": raw.get("updatedAt"),
+        "head_sha": raw.get("headRefOid"),
+        "is_draft": bool(raw.get("isDraft")),
+        "merge_state": raw.get("mergeStateStatus"),
+        "checks_successful": checks_successful,
+        "ready_to_merge": ready,
+        "check_counts": counts,
+    }
+
+
+def fetch_dependabot_prs(config: MonitorConfig) -> tuple[list[dict[str, Any]], str | None]:
+    cmd = [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        config.dependabot_repo,
+        "--author",
+        "app/dependabot",
+        "--state",
+        "open",
+        "--json",
+        "number,title,url,headRefOid,statusCheckRollup,mergeStateStatus,isDraft,updatedAt",
+        "--limit",
+        str(config.dependabot_pr_limit),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=config.lana_bank_dir,
+            text=True,
+            capture_output=True,
+            timeout=config.gh_timeout_seconds,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        if proc.returncode != 0:
+            return [], proc.stderr.strip() or f"gh exited with {proc.returncode}"
+        payload = json.loads(proc.stdout or "[]")
+        if not isinstance(payload, list):
+            return [], "gh returned non-list PR payload"
+        return [normalize_dependabot_pr(pr) for pr in payload if isinstance(pr, dict)], None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def concourse_build_url(config: MonitorConfig, failure: dict[str, Any]) -> str | None:
+    team = failure.get("team")
+    pipeline = failure.get("pipeline")
+    job = failure.get("job")
+    build_name = failure.get("build_name") or failure.get("name")
+    if not all([team, pipeline, job, build_name]):
+        return None
+    return (
+        f"{config.concourse_url}/teams/{team}/pipelines/{pipeline}/jobs/{job}/builds/{build_name}"
+    )
+
+
+def normalize_concourse_failures(
+    payload: Any,
+    config: MonitorConfig,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if payload is None:
+        return [], None
+    if not isinstance(payload, list):
+        return [], "Expected concourse_failures array"
+    failures: list[dict[str, Any]] = []
+    for raw in payload[: config.concourse_failure_limit]:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("status", "")).lower()
+        if status and status not in CONCOURSE_FAILURE_STATUSES:
+            continue
+        failure = {
+            "team": raw.get("team"),
+            "pipeline": raw.get("pipeline"),
+            "job": raw.get("job"),
+            "status": status or raw.get("status"),
+            "build_id": raw.get("build_id"),
+            "build_name": raw.get("build_name") or raw.get("name"),
+            "start_time": raw.get("start_time"),
+            "end_time": raw.get("end_time"),
+            "resources": raw.get("resources") if isinstance(raw.get("resources"), list) else [],
+            "log_summary": raw.get("log_summary"),
+            "failure_summary": raw.get("failure_summary"),
+            "url": raw.get("url"),
+        }
+        if not failure["url"]:
+            failure["url"] = concourse_build_url(config, failure)
+        failures.append(failure)
+    return failures, None
+
+
 def poll_prompt(config: MonitorConfig) -> str:
     assignee_filter = (
         "Only include incidents whose Zenduty detail assigned_to exactly equals one of these user IDs:\n"
@@ -392,9 +571,26 @@ def poll_prompt(config: MonitorConfig) -> str:
         f"""
         Use MCP Drua Zenduty tools from this Codex session.
 
-        List all open Zenduty incidents with statuses triggered and acknowledged.
+        List open Zenduty incidents by calling zenduty_list_incidents twice:
+        - once with statuses exactly ["triggered"]
+        - once with statuses exactly ["acknowledged"]
+        Do not rely on the tool's default statuses, and do not combine status names in one call.
         Fetch detail records as needed to include assigned_to and to apply the assignee filter.
+        For incidents whose title starts with "[HoneyComb]" or whose detail summary contains a Honeycomb URL:
+        - include the Zenduty detail summary in "summary"
+        - extract all Honeycomb URLs into "honeycomb_urls"
+        - call honeycomb_get_query_results with the first Honeycomb URL and include a compact text summary in "honeycomb_query_results"
         {assignee_filter}
+
+        Also inspect Concourse at https://ci.galoy.io/ using MCP Drua Concourse tools:
+        - call concourse_list_pipelines
+        - for each active, non-paused, non-archived pipeline, call concourse_list_jobs
+        - include jobs whose last_status is failed, errored, or aborted
+        - for each failed job, call concourse_get_build_status
+        - call concourse_get_build_resources for the build_id when available
+        - call concourse_get_build_logs for the build_id and summarize the likely failure cause in one sentence
+        - construct url as https://ci.galoy.io/teams/<team>/pipelines/<pipeline>/jobs/<job>/builds/<build_name>
+        Limit concourse_failures to {config.concourse_failure_limit} entries.
 
         Return only valid JSON, with no markdown and no prose:
         {{
@@ -407,7 +603,28 @@ def poll_prompt(config: MonitorConfig) -> str:
               "title": "...",
               "creation_date": "...",
               "urgency": 1,
-              "assigned_to": "..."
+              "assigned_to": "...",
+              "summary": "...",
+              "honeycomb_urls": ["https://ui.honeycomb.io/..."],
+              "honeycomb_query_results": "..."
+            }}
+          ],
+          "concourse_failures": [
+            {{
+              "team": "dev",
+              "pipeline": "pipeline-name",
+              "job": "job-name",
+              "status": "failed",
+              "build_id": 123,
+              "build_name": "456",
+              "start_time": 1778660000,
+              "end_time": 1778660300,
+              "url": "https://ci.galoy.io/teams/dev/pipelines/pipeline-name/jobs/job-name/builds/456",
+              "resources": [
+                {{"resource": "repo", "version": {{"ref": "..."}}}}
+              ],
+              "log_summary": "One sentence with the relevant failing command or error.",
+              "failure_summary": "One sentence identifying the failed pipeline/job and probable cause."
             }}
           ]
         }}
@@ -427,9 +644,14 @@ def triage_prompt(incident: dict[str, Any]) -> str:
         - title: {incident.get("title")}
         - creation_date: {incident.get("creation_date")}
         - assigned_to: {incident.get("assigned_to")}
+        - summary: {incident.get("summary")}
+        - honeycomb_urls: {incident.get("honeycomb_urls")}
+        - honeycomb_query_results: {incident.get("honeycomb_query_results")}
 
         Fetch the incident details, inspect linked Honeycomb context, identify the code path,
         classify as false positive or real problem, and add a Zenduty note with the final summary.
+        If this is a HoneyComb incident and honeycomb_urls is present, call honeycomb_get_query_results
+        with the first URL before forming the final diagnosis.
 
         Do not resolve the incident.
         Do not push.
@@ -466,6 +688,9 @@ def normalize_incidents(payload: Any) -> list[dict[str, Any]]:
                 "urgency": raw.get("urgency"),
                 "assigned_to": raw.get("assigned_to"),
                 "assignee_alias": raw.get("assignee_alias"),
+                "summary": raw.get("summary"),
+                "honeycomb_urls": raw.get("honeycomb_urls") if isinstance(raw.get("honeycomb_urls"), list) else [],
+                "honeycomb_query_results": raw.get("honeycomb_query_results"),
             }
         )
     return incidents
@@ -474,12 +699,29 @@ def normalize_incidents(payload: Any) -> list[dict[str, Any]]:
 def write_status(
     config: MonitorConfig,
     incidents: list[dict[str, Any]],
+    dependabot_prs: list[dict[str, Any]] | None = None,
+    concourse_failures: list[dict[str, Any]] | None = None,
     error: str | None = None,
+    dependabot_error: str | None = None,
+    concourse_error: str | None = None,
     store: Store | None = None,
 ) -> None:
+    dependabot_prs = dependabot_prs or []
+    concourse_failures = concourse_failures or []
     triggered = [i for i in incidents if i.get("status") == "triggered"]
     acknowledged = [i for i in incidents if i.get("status") == "acknowledged"]
-    color = "red" if triggered else "yellow" if acknowledged else "green"
+    ready_dependabot_prs = [pr for pr in dependabot_prs if pr.get("ready_to_merge")]
+    concourse_snooze = read_concourse_snooze(config)
+    active_concourse_failures = concourse_failures if not concourse_snooze["active"] else []
+    color = (
+        "red"
+        if triggered or active_concourse_failures
+        else "yellow"
+        if acknowledged
+        else "blue"
+        if ready_dependabot_prs
+        else "green"
+    )
     if error:
         color = "gray"
 
@@ -487,10 +729,30 @@ def write_status(
         "updated_at": utc_now(),
         "color": color,
         "error": error,
+        "dependabot_error": dependabot_error,
+        "concourse_error": concourse_error,
         "counts": {
             "triggered": len(triggered),
             "acknowledged": len(acknowledged),
             "open": len(triggered) + len(acknowledged),
+            "dependabot_open": len(dependabot_prs),
+            "dependabot_ready": len(ready_dependabot_prs),
+            "concourse_failed": len(concourse_failures),
+            "concourse_unsnoozed_failed": len(active_concourse_failures),
+        },
+        "dependabot": {
+            "repo": config.dependabot_repo,
+            "open": len(dependabot_prs),
+            "ready": len(ready_dependabot_prs),
+            "prs": dependabot_prs,
+            "error": dependabot_error,
+        },
+        "concourse": {
+            "url": config.concourse_url,
+            "failed": len(concourse_failures),
+            "failures": concourse_failures,
+            "error": concourse_error,
+            "snooze": concourse_snooze,
         },
         "assignee_user_id": list(config.assignee_user_id),
         "assignee_aliases": config.assignee_aliases,
@@ -510,8 +772,9 @@ def e(value: Any) -> str:
 
 def status_label(color: str) -> str:
     return {
-        "red": "Triggered incidents",
+        "red": "Incidents or CI failures",
         "yellow": "Acknowledged incidents",
+        "blue": "Dependabot PRs ready",
         "green": "No open incidents",
         "gray": "Monitor unavailable",
     }.get(color, "Unknown")
@@ -523,6 +786,11 @@ def write_details_html(
     store: Store | None = None,
 ) -> None:
     incidents = status.get("incidents", [])
+    dependabot = status.get("dependabot", {})
+    dependabot_prs = dependabot.get("prs", []) if isinstance(dependabot, dict) else []
+    concourse = status.get("concourse", {})
+    concourse_failures = concourse.get("failures", []) if isinstance(concourse, dict) else []
+    concourse_snooze = concourse.get("snooze", {}) if isinstance(concourse, dict) else {}
     runs = store.recent_runs() if store is not None else []
     rows = []
     for incident in incidents:
@@ -531,6 +799,20 @@ def write_details_html(
         assigned_to_label = (
             f"{assignee_alias} ({assigned_to})" if assignee_alias and assigned_to else assigned_to
         )
+        honeycomb_urls = incident.get("honeycomb_urls") or []
+        honeycomb_links = " ".join(
+            f'<a href="{e(url)}">Honeycomb query</a>' for url in honeycomb_urls if url
+        )
+        honeycomb_details = ""
+        if incident.get("summary") or honeycomb_links or incident.get("honeycomb_query_results"):
+            honeycomb_details = f"""
+              <section>
+                <h3>Honeycomb Context</h3>
+                {f'<p>{honeycomb_links}</p>' if honeycomb_links else ''}
+                {f'<p>{e(incident.get("summary"))}</p>' if incident.get("summary") else ''}
+                {f'<pre>{e(incident.get("honeycomb_query_results"))}</pre>' if incident.get("honeycomb_query_results") else ''}
+              </section>
+            """
         log_path = incident.get("triage_log_path")
         log_link = (
             f'<a href="file://{e(log_path)}">triage log</a>'
@@ -558,6 +840,65 @@ def write_details_html(
                 <h3>Triage Summary</h3>
                 <p>{e(incident.get('triage_summary') or 'No triage summary recorded yet.')}</p>
               </section>
+              {honeycomb_details}
+            </article>
+            """
+        )
+
+    pr_rows = []
+    for pr in dependabot_prs:
+        counts = pr.get("check_counts") or {}
+        readiness = "ready" if pr.get("ready_to_merge") else "not ready"
+        url = pr.get("url")
+        pr_link = f'<a href="{e(url)}">#{e(pr.get("number", "?"))}</a>' if url else f'#{e(pr.get("number", "?"))}'
+        pr_rows.append(
+            f"""
+            <article class="incident {'ready' if pr.get('ready_to_merge') else 'blocked'}">
+              <header>
+                <div>
+                  <h2>{pr_link}</h2>
+                  <p class="title">{e(pr.get('title'))}</p>
+                </div>
+                <span class="pill">{readiness}</span>
+              </header>
+              <dl>
+                <div><dt>Checks</dt><dd>{e(counts.get('success', 0))} ok · {e(counts.get('failure', 0))} failed · {e(counts.get('pending', 0))} pending</dd></div>
+                <div><dt>Merge State</dt><dd><code>{e(pr.get('merge_state'))}</code></dd></div>
+                <div><dt>Updated</dt><dd>{e(pr.get('updated_at'))}</dd></div>
+              </dl>
+            </article>
+            """
+        )
+
+    concourse_rows = []
+    for failure in concourse_failures:
+        resources = failure.get("resources") or []
+        resource_text = ", ".join(
+            f"{resource.get('resource')}: {json.dumps(resource.get('version'), sort_keys=True)}"
+            for resource in resources
+            if isinstance(resource, dict)
+        )
+        url = failure.get("url")
+        title = f"{failure.get('pipeline')}/{failure.get('job')}"
+        title_html = f'<a href="{e(url)}">{e(title)}</a>' if url else e(title)
+        concourse_rows.append(
+            f"""
+            <article class="incident failed">
+              <header>
+                <div>
+                  <h2>{title_html}</h2>
+                  <p class="title">{e(failure.get('failure_summary') or failure.get('log_summary'))}</p>
+                </div>
+                <span class="pill">{e(failure.get('status'))}</span>
+              </header>
+              <dl>
+                <div><dt>Team</dt><dd>{e(failure.get('team'))}</dd></div>
+                <div><dt>Build</dt><dd><code>{e(failure.get('build_name') or failure.get('build_id'))}</code></dd></div>
+                <div><dt>Started</dt><dd>{e(failure.get('start_time'))}</dd></div>
+                <div><dt>Finished</dt><dd>{e(failure.get('end_time'))}</dd></div>
+              </dl>
+              {f'<pre>{e(resource_text)}</pre>' if resource_text else ''}
+              {f'<pre>{e(failure.get("log_summary"))}</pre>' if failure.get("log_summary") else ''}
             </article>
             """
         )
@@ -574,6 +915,14 @@ def write_details_html(
         )
 
     body = "\n".join(rows) or '<p class="empty">No filtered open incidents.</p>'
+    prs_body = "\n".join(pr_rows) or '<p class="empty">No open Dependabot PRs.</p>'
+    concourse_body = "\n".join(concourse_rows) or '<p class="empty">No failed Concourse jobs.</p>'
+    concourse_snooze_note = (
+        f'<p class="muted">Concourse failures are snoozed until <code>{e(concourse_snooze.get("until"))}</code>. '
+        f'Clear with <code>python3 -m lana_zenduty_monitor unsnooze-concourse</code>.</p>'
+        if concourse_snooze.get("active")
+        else '<p class="muted">Snooze with <code>python3 -m lana_zenduty_monitor snooze-concourse --minutes 60</code>.</p>'
+    )
     runs_body = "\n".join(run_rows) or '<tr><td colspan="6">No monitor runs recorded.</td></tr>'
     color = status.get("color", "gray")
     counts = status.get("counts", {})
@@ -593,6 +942,7 @@ def write_details_html(
       --border: #303845;
       --red: #ff5c5c;
       --yellow: #f6d32d;
+      --blue: #62a0ea;
       --green: #33d17a;
       --gray: #9a9996;
     }}
@@ -678,6 +1028,14 @@ def write_details_html(
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 13px;
     }}
+    pre {{
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: rgba(255, 255, 255, .04);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+    }}
     a {{ color: #8ab4f8; }}
     .empty {{
       background: var(--panel);
@@ -711,10 +1069,23 @@ def write_details_html(
       <div class="counts">
         <div class="count"><strong>{e(counts.get('triggered', 0))}</strong><span>Triggered</span></div>
         <div class="count"><strong>{e(counts.get('acknowledged', 0))}</strong><span>Acknowledged</span></div>
-        <div class="count"><strong>{e(counts.get('open', 0))}</strong><span>Open</span></div>
+        <div class="count"><strong>{e(counts.get('concourse_failed', 0))}</strong><span>CI Failed</span></div>
       </div>
     </section>
     <section>{body}</section>
+    <section>
+      <h2>Concourse Failures</h2>
+      <p class="muted">Failed, errored, or aborted jobs from {e(config.concourse_url)}.</p>
+      {concourse_snooze_note}
+      {f'<p class="muted">Error: {e(status.get("concourse_error"))}</p>' if status.get("concourse_error") else ""}
+      {concourse_body}
+    </section>
+    <section>
+      <h2>Dependabot Pull Requests</h2>
+      <p class="muted">Ready means open, not draft, and all reported checks completed successfully.</p>
+      {f'<p class="muted">Error: {e(status.get("dependabot_error"))}</p>' if status.get("dependabot_error") else ""}
+      {prs_body}
+    </section>
     <section>
       <h2>Recent Runs</h2>
       <div class="runs">
@@ -754,12 +1125,40 @@ def do_poll(config: MonitorConfig) -> int:
             raise RuntimeError(f"codex exited with {proc.returncode}")
         payload = extract_json(proc.stdout)
         incidents = add_assignee_aliases(config, normalize_incidents(payload))
+        concourse_failures, concourse_error = normalize_concourse_failures(
+            payload.get("concourse_failures") if isinstance(payload, dict) else None,
+            config,
+        )
+        dependabot_prs, dependabot_error = fetch_dependabot_prs(config)
         new_incidents = store.upsert_incidents(incidents)
         incidents = store.enrich_incidents(incidents)
-        write_status(config, incidents, store=store)
+        write_status(
+            config,
+            incidents,
+            dependabot_prs=dependabot_prs,
+            concourse_failures=concourse_failures,
+            dependabot_error=dependabot_error,
+            concourse_error=concourse_error,
+            store=store,
+        )
         store.finish_run(run_id, True)
 
-        print(json.dumps({"open": len(incidents), "new": len(new_incidents)}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "open": len(incidents),
+                    "new": len(new_incidents),
+                    "dependabot_open": len(dependabot_prs),
+                    "dependabot_ready": len(
+                        [pr for pr in dependabot_prs if pr.get("ready_to_merge")]
+                    ),
+                    "dependabot_error": dependabot_error,
+                    "concourse_failed": len(concourse_failures),
+                    "concourse_error": concourse_error,
+                },
+                indent=2,
+            )
+        )
         if config.triage_new_incidents:
             for incident in new_incidents:
                 do_triage(config, incident["unique_id"], store=store)
@@ -836,7 +1235,47 @@ def refresh_status_from_disk(config: MonitorConfig, store: Store) -> None:
     incidents = normalize_incidents({"incidents": status.get("incidents", [])})
     incidents = add_assignee_aliases(config, incidents)
     incidents = store.enrich_incidents(incidents)
-    write_status(config, incidents, error=status.get("error"), store=store)
+    dependabot = status.get("dependabot", {})
+    dependabot_prs = dependabot.get("prs", []) if isinstance(dependabot, dict) else []
+    concourse = status.get("concourse", {})
+    concourse_failures = (
+        concourse.get("failures", []) if isinstance(concourse, dict) else []
+    )
+    write_status(
+        config,
+        incidents,
+        dependabot_prs=dependabot_prs,
+        concourse_failures=concourse_failures,
+        error=status.get("error"),
+        dependabot_error=status.get("dependabot_error"),
+        concourse_error=status.get("concourse_error"),
+        store=store,
+    )
+
+
+def do_snooze_concourse(config: MonitorConfig, minutes: int) -> int:
+    if minutes <= 0:
+        print("minutes must be positive", file=sys.stderr)
+        return 2
+    snooze = set_concourse_snooze(config, minutes)
+    store = Store(config.state_dir)
+    try:
+        refresh_status_from_disk(config, store)
+    finally:
+        store.close()
+    print(json.dumps({"concourse_snoozed_until": snooze["until"]}, indent=2))
+    return 0
+
+
+def do_unsnooze_concourse(config: MonitorConfig) -> int:
+    clear_concourse_snooze(config)
+    store = Store(config.state_dir)
+    try:
+        refresh_status_from_disk(config, store)
+    finally:
+        store.close()
+    print(json.dumps({"concourse_snoozed_until": None}, indent=2))
+    return 0
 
 
 def print_status(config: MonitorConfig, write_default: bool) -> int:
@@ -856,6 +1295,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("poll")
     sub.add_parser("daemon")
+    snooze = sub.add_parser("snooze-concourse")
+    snooze.add_argument("--minutes", type=int, default=60)
+    sub.add_parser("unsnooze-concourse")
     triage = sub.add_parser("triage")
     triage.add_argument("incident_id")
     status = sub.add_parser("status")
@@ -867,6 +1309,10 @@ def main(argv: list[str] | None = None) -> int:
         return do_poll(config)
     if args.command == "daemon":
         return do_daemon(config)
+    if args.command == "snooze-concourse":
+        return do_snooze_concourse(config, args.minutes)
+    if args.command == "unsnooze-concourse":
+        return do_unsnooze_concourse(config)
     if args.command == "triage":
         return do_triage(config, args.incident_id)
     if args.command == "status":

@@ -3,7 +3,12 @@ lana_bank_dir = "/home/sebver/source/repos/lana-bank"
 state_dir = "/home/sebver/.local/state/lana-zenduty-monitor"
 poll_interval_seconds = 300
 codex_timeout_seconds = 600
+gh_timeout_seconds = 120
 triage_new_incidents = true
+dependabot_repo = "GaloyMoney/lana-bank"
+dependabot_pr_limit = 50
+concourse_url = "https://ci.galoy.io"
+concourse_failure_limit = 20
 
 # Filter incidents by Zenduty assigned_to. Omit this to read from .env.
 # Empty list disables assignee filtering.

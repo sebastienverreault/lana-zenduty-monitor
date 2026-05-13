@@ -5,7 +5,7 @@ SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 GNOME_EXT_UUID := lana-zenduty-monitor@galoy.io
 GNOME_EXT_DIR := $(HOME)/.local/share/gnome-shell/extensions/$(GNOME_EXT_UUID)
 
-.PHONY: help init poll daemon triage test install-user-service enable-user-service disable-user-service install-gnome-extension enable-gnome-extension status details clean-state
+.PHONY: help init poll daemon triage test install-user-service enable-user-service disable-user-service install-gnome-extension enable-gnome-extension reload-gnome-extension status details clean-state
 
 help:
 	@printf '%s\n' \
@@ -20,6 +20,7 @@ help:
 		'  make enable-user-service     Enable and start systemd user timer' \
 		'  make install-gnome-extension Install GNOME Shell extension files' \
 		'  make enable-gnome-extension  Enable installed GNOME Shell extension' \
+		'  make reload-gnome-extension  Install and reload GNOME Shell extension' \
 		'  make status                  Show monitor status JSON'
 
 init:
@@ -58,9 +59,13 @@ disable-user-service:
 
 install-gnome-extension:
 	mkdir -p "$(GNOME_EXT_DIR)"
-	cp gnome-extension/metadata.json gnome-extension/extension.js "$(GNOME_EXT_DIR)/"
+	cp gnome-extension/metadata.json gnome-extension/extension.js gnome-extension/zenduty.svg "$(GNOME_EXT_DIR)/"
 
 enable-gnome-extension: install-gnome-extension
+	gnome-extensions enable "$(GNOME_EXT_UUID)"
+
+reload-gnome-extension: install-gnome-extension
+	gnome-extensions disable "$(GNOME_EXT_UUID)" || true
 	gnome-extensions enable "$(GNOME_EXT_UUID)"
 
 status:

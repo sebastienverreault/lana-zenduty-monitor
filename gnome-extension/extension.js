@@ -1,3 +1,4 @@
+import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
@@ -33,12 +34,40 @@ class LanaZendutyIndicator extends PanelMenu.Button {
             'lana-zenduty-monitor',
             'logs',
         ]);
+        this._repoPath = GLib.build_filenamev([
+            GLib.get_home_dir(),
+            'source',
+            'repos',
+            'lana-zenduty-monitor',
+        ]);
 
+        this._attentionOverlay = null;
+        this._attentionEventId = 0;
+        this._dismissedAttentionKey = null;
+        const extensionPath = this._extension.path ||
+            (this._extension.dir ? this._extension.dir.get_path() : '.');
+        this._zendutyIconPath = GLib.build_filenamev([
+            extensionPath,
+            'zenduty.svg',
+        ]);
+
+        this._iconWrap = new St.Bin({
+            width: 22,
+            height: 22,
+            style: [
+                `background-image: url("${GLib.filename_to_uri(this._zendutyIconPath, null)}");`,
+                'background-size: contain;',
+                'background-repeat: no-repeat;',
+                'background-position: center;',
+                'padding: 2px;',
+            ].join(' '),
+        });
         this._icon = new St.Icon({
             icon_name: 'emblem-ok-symbolic',
             style_class: 'system-status-icon',
         });
-        this.add_child(this._icon);
+        this._iconWrap.set_child(this._icon);
+        this.add_child(this._iconWrap);
 
         this._summaryItem = new PopupMenu.PopupMenuItem('LANA Zenduty: loading', {
             reactive: false,
@@ -47,6 +76,9 @@ class LanaZendutyIndicator extends PanelMenu.Button {
 
         this._incidentSection = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._incidentSection);
+
+        this._dependabotSection = new PopupMenu.PopupMenuSection();
+        this.menu.addMenuItem(this._dependabotSection);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         const openDetails = new PopupMenu.PopupMenuItem('Open details');
@@ -67,6 +99,18 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         });
         this.menu.addMenuItem(refreshNow);
 
+        const snoozeConcourse = new PopupMenu.PopupMenuItem('Snooze Concourse failures 1h');
+        snoozeConcourse.connect('activate', () => {
+            this._runMonitorCommand('snooze-concourse --minutes 60');
+        });
+        this.menu.addMenuItem(snoozeConcourse);
+
+        const clearConcourseSnooze = new PopupMenu.PopupMenuItem('Clear Concourse snooze');
+        clearConcourseSnooze.connect('activate', () => {
+            this._runMonitorCommand('unsnooze-concourse');
+        });
+        this.menu.addMenuItem(clearConcourseSnooze);
+
         this._refresh();
         this._timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 15, () => {
             this._refresh();
@@ -79,6 +123,7 @@ class LanaZendutyIndicator extends PanelMenu.Button {
             GLib.Source.remove(this._timerId);
             this._timerId = null;
         }
+        this._hideAttentionOverlay();
         super.destroy();
     }
 
@@ -103,11 +148,29 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         GLib.spawn_command_line_async(`xdg-open ${GLib.shell_quote(path)}`);
     }
 
+    _runMonitorCommand(command) {
+        const shellCommand = [
+            `cd ${GLib.shell_quote(this._repoPath)}`,
+            'set -a',
+            '[ ! -f .env ] || source .env',
+            'set +a',
+            `python3 -m lana_zenduty_monitor ${command}`,
+        ].join('; ');
+        GLib.spawn_command_line_async(`zsh -lc ${GLib.shell_quote(shellCommand)}`);
+        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            this._refresh();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _applyStatus(status) {
         const color = status.color || 'gray';
         const counts = status.counts || {};
         const triggered = counts.triggered || 0;
         const acknowledged = counts.acknowledged || 0;
+        const dependabotReady = counts.dependabot_ready || 0;
+        const dependabotOpen = counts.dependabot_open || 0;
+        const concourseFailed = counts.concourse_failed || 0;
 
         if (color === 'red') {
             this._icon.icon_name = 'dialog-warning-symbolic';
@@ -115,6 +178,9 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         } else if (color === 'yellow') {
             this._icon.icon_name = 'dialog-warning-symbolic';
             this._icon.style = 'color: #f6d32d;';
+        } else if (color === 'blue') {
+            this._icon.icon_name = 'software-update-available-symbolic';
+            this._icon.style = 'color: #62a0ea;';
         } else if (color === 'green') {
             this._icon.icon_name = 'emblem-ok-symbolic';
             this._icon.style = 'color: #33d17a;';
@@ -125,8 +191,10 @@ class LanaZendutyIndicator extends PanelMenu.Button {
 
         const updated = status.updated_at || 'never';
         const error = status.error ? ` error: ${status.error}` : '';
+        const dependabotError = status.dependabot_error ? ` dependabot error: ${status.dependabot_error}` : '';
+        const concourseError = status.concourse_error ? ` concourse error: ${status.concourse_error}` : '';
         this._summaryItem.label.text =
-            `Triggered: ${triggered}  Acknowledged: ${acknowledged}  Updated: ${updated}${error}`;
+            `Zenduty: ${triggered} triggered · ${acknowledged} acknowledged  Updated: ${updated}${error}${dependabotError}${concourseError}`;
 
         this._incidentSection.removeAll();
         const incidents = status.incidents || [];
@@ -134,25 +202,165 @@ class LanaZendutyIndicator extends PanelMenu.Button {
             this._incidentSection.addMenuItem(new PopupMenu.PopupMenuItem('No filtered open incidents', {
                 reactive: false,
             }));
-            return;
+        } else {
+            for (const incident of incidents.slice(0, 8)) {
+                const number = incident.incident_number || '?';
+                const state = incident.status || '?';
+                const title = (incident.title || '').replace(/\s+/g, ' ').slice(0, 90);
+                const row = new PopupMenu.PopupMenuItem(`#${number} ${state}: ${title}`);
+                row.connect('activate', () => {
+                    this._openPath(incident.triage_log_path || this._detailsPath);
+                });
+                this._incidentSection.addMenuItem(row);
+
+                const created = incident.creation_date || 'unknown time';
+                const triage = incident.triage_status || 'pending';
+                this._incidentSection.addMenuItem(new PopupMenu.PopupMenuItem(
+                    `  created ${created} · triage ${triage}`,
+                    {reactive: false}
+                ));
+            }
         }
 
-        for (const incident of incidents.slice(0, 8)) {
-            const number = incident.incident_number || '?';
-            const state = incident.status || '?';
-            const title = (incident.title || '').replace(/\s+/g, ' ').slice(0, 90);
-            const row = new PopupMenu.PopupMenuItem(`#${number} ${state}: ${title}`);
-            row.connect('activate', () => {
-                this._openPath(incident.triage_log_path || this._detailsPath);
-            });
-            this._incidentSection.addMenuItem(row);
+        this._dependabotSection.removeAll();
+        const concourse = status.concourse || {};
+        const failures = concourse.failures || [];
+        const concourseSnooze = concourse.snooze || {};
+        const snoozeText = concourseSnooze.active ? ` · snoozed until ${concourseSnooze.until}` : '';
+        this._dependabotSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._dependabotSection.addMenuItem(new PopupMenu.PopupMenuItem(
+            `Concourse: ${failures.length} failed${snoozeText}`,
+            {reactive: false}
+        ));
+        if (failures.length === 0) {
+            this._dependabotSection.addMenuItem(new PopupMenu.PopupMenuItem('No failed Concourse jobs', {
+                reactive: false,
+            }));
+        } else {
+            for (const failure of failures.slice(0, 8)) {
+                const pipeline = failure.pipeline || '?';
+                const job = failure.job || '?';
+                const state = failure.status || 'failed';
+                const summary = (failure.failure_summary || failure.log_summary || '')
+                    .replace(/\s+/g, ' ')
+                    .slice(0, 90);
+                const row = new PopupMenu.PopupMenuItem(`${pipeline}/${job} ${state}: ${summary}`);
+                row.connect('activate', () => {
+                    this._openPath(failure.url || this._detailsPath);
+                });
+                this._dependabotSection.addMenuItem(row);
+            }
+        }
 
-            const created = incident.creation_date || 'unknown time';
-            const triage = incident.triage_status || 'pending';
-            this._incidentSection.addMenuItem(new PopupMenu.PopupMenuItem(
-                `  created ${created} · triage ${triage}`,
-                {reactive: false}
-            ));
+        const dependabot = status.dependabot || {};
+        const prs = dependabot.prs || [];
+        const readyPrs = prs.filter(pr => pr.ready_to_merge);
+        this._dependabotSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._dependabotSection.addMenuItem(new PopupMenu.PopupMenuItem(
+            `Dependabot: ${readyPrs.length} ready / ${prs.length} open`,
+            {reactive: false}
+        ));
+        if (prs.length === 0) {
+            this._dependabotSection.addMenuItem(new PopupMenu.PopupMenuItem('No open Dependabot PRs', {
+                reactive: false,
+            }));
+        } else {
+            for (const pr of prs.slice(0, 8)) {
+                const counts = pr.check_counts || {};
+                const number = pr.number || '?';
+                const state = pr.ready_to_merge ? 'ready' : 'blocked';
+                const title = (pr.title || '').replace(/\s+/g, ' ').slice(0, 90);
+                const row = new PopupMenu.PopupMenuItem(`#${number} ${state}: ${title}`);
+                row.connect('activate', () => {
+                    this._openPath(pr.url || this._detailsPath);
+                });
+                this._dependabotSection.addMenuItem(row);
+                this._dependabotSection.addMenuItem(new PopupMenu.PopupMenuItem(
+                    `  checks ${counts.success || 0} ok · ${counts.failure || 0} failed · ${counts.pending || 0} pending`,
+                    {reactive: false}
+                ));
+            }
+        }
+
+        this._syncAttentionOverlay(status);
+    }
+
+    _attentionKey(status) {
+        const counts = status.counts || {};
+        const triggered = counts.triggered || 0;
+        const acknowledged = counts.acknowledged || 0;
+        const dependabotReady = counts.dependabot_ready || 0;
+        const concourse = status.concourse || {};
+        const concourseSnooze = concourse.snooze || {};
+        const concourseFailed = concourseSnooze.active ? 0 : (counts.concourse_failed || 0);
+        const error = status.error || status.dependabot_error || status.concourse_error || '';
+        if (!triggered && !acknowledged && !dependabotReady && !concourseFailed && !error)
+            return null;
+        return [
+            status.color || 'gray',
+            triggered,
+            acknowledged,
+            dependabotReady,
+            concourseFailed,
+            error,
+            (status.incidents || []).map(incident => incident.unique_id || incident.incident_number).join(','),
+            ((status.concourse || {}).failures || [])
+                .map(failure => `${failure.pipeline}/${failure.job}/${failure.build_id}`)
+                .join(','),
+            ((status.dependabot || {}).prs || [])
+                .filter(pr => pr.ready_to_merge)
+                .map(pr => pr.number)
+                .join(','),
+        ].join('|');
+    }
+
+    _syncAttentionOverlay(status) {
+        const key = this._attentionKey(status);
+        if (!key) {
+            this._dismissedAttentionKey = null;
+            this._hideAttentionOverlay();
+            return;
+        }
+        if (key === this._dismissedAttentionKey || this._attentionOverlay)
+            return;
+        this._showAttentionOverlay(key);
+    }
+
+    _showAttentionOverlay(key) {
+        this._attentionOverlay = new St.Widget({
+            reactive: true,
+            style: 'background-color: rgba(224, 27, 36, 0.42);',
+            x: 0,
+            y: 0,
+            width: global.stage.width,
+            height: global.stage.height,
+        });
+        Main.uiGroup.add_child(this._attentionOverlay);
+        this._attentionOverlay.set_position(0, 0);
+        this._attentionOverlay.set_size(global.stage.width, global.stage.height);
+        this._attentionEventId = global.stage.connect('captured-event', (_actor, event) => {
+            const eventType = event.type();
+            if (
+                eventType === Clutter.EventType.KEY_PRESS ||
+                eventType === Clutter.EventType.BUTTON_PRESS ||
+                eventType === Clutter.EventType.MOTION ||
+                eventType === Clutter.EventType.TOUCH_BEGIN
+            ) {
+                this._dismissedAttentionKey = key;
+                this._hideAttentionOverlay();
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
+    }
+
+    _hideAttentionOverlay() {
+        if (this._attentionEventId) {
+            global.stage.disconnect(this._attentionEventId);
+            this._attentionEventId = 0;
+        }
+        if (this._attentionOverlay) {
+            this._attentionOverlay.destroy();
+            this._attentionOverlay = null;
         }
     }
 });
