@@ -5,8 +5,13 @@ poll_interval_seconds = 300
 codex_timeout_seconds = 600
 triage_new_incidents = true
 
-# Filter incidents by Zenduty assigned_to. Empty string disables assignee filtering.
-assignee_user_id = "a7eecf16-e8fa-4903-90ea-8"
+# Filter incidents by Zenduty assigned_to. Omit this to read from .env.
+# Empty list disables assignee filtering.
+# assignee_user_id = ["zenduty-user-id-1", "zenduty-user-id-2"]
+#
+# Optional aliases for display. Omit this to read from .env.
+# [monitor.assignee_aliases]
+# "zenduty-user-id-1" = "person@example.com"
 
 [codex]
 command = "codex"
@@ -15,4 +20,3 @@ sandbox = "danger-full-access"
 
 # Extra args are appended before the prompt.
 extra_args = []
-

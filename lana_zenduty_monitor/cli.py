@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ASSIGNEE = "a7eecf16-e8fa-4903-90ea-8"
+ASSIGNEE_USER_IDS_ENV = "LANA_ZENDUTY_ASSIGNEE_USER_IDS"
+ASSIGNEE_ALIASES_ENV = "LANA_ZENDUTY_ASSIGNEE_ALIASES"
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "lana-zenduty-monitor" / "config.toml"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "lana-zenduty-monitor"
 DEFAULT_LANA_BANK_DIR = Path.home() / "source" / "repos" / "lana-bank"
@@ -38,8 +39,57 @@ class MonitorConfig:
     poll_interval_seconds: int = 300
     codex_timeout_seconds: int = 600
     triage_new_incidents: bool = True
-    assignee_user_id: str = DEFAULT_ASSIGNEE
+    assignee_user_id: tuple[str, ...] = ()
+    assignee_aliases: dict[str, str] | None = None
     codex: CodexConfig = CodexConfig()
+
+    def __post_init__(self) -> None:
+        if self.assignee_aliases is None:
+            object.__setattr__(self, "assignee_aliases", {})
+
+
+def split_env_list(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def env_assignee_user_ids() -> tuple[str, ...]:
+    return split_env_list(os.environ.get(ASSIGNEE_USER_IDS_ENV, ""))
+
+
+def env_assignee_aliases() -> dict[str, str]:
+    raw = os.environ.get(ASSIGNEE_ALIASES_ENV, "").strip()
+    if not raw:
+        return {}
+    aliases: dict[str, str] = {}
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        user_id, sep, alias = item.partition("=")
+        if not sep:
+            raise ValueError(f"{ASSIGNEE_ALIASES_ENV} entries must use user_id=alias")
+        aliases[user_id.strip()] = alias.strip()
+    return aliases
+
+
+def parse_assignee_user_ids(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return env_assignee_user_ids()
+    if isinstance(value, str):
+        assignee = value.strip()
+        return (assignee,) if assignee else ()
+    if isinstance(value, list):
+        return tuple(str(assignee).strip() for assignee in value if str(assignee).strip())
+    raise TypeError("monitor.assignee_user_id must be a string or list of strings")
+
+
+def parse_assignee_aliases(value: Any) -> dict[str, str]:
+    aliases = env_assignee_aliases()
+    if value is None:
+        return aliases
+    if not isinstance(value, dict):
+        raise TypeError("monitor.assignee_aliases must be a table mapping user IDs to aliases")
+    aliases.update({str(user_id): str(alias) for user_id, alias in value.items()})
+    return aliases
 
 
 def utc_now() -> str:
@@ -60,7 +110,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MonitorConfig:
         poll_interval_seconds=int(monitor.get("poll_interval_seconds", 300)),
         codex_timeout_seconds=int(monitor.get("codex_timeout_seconds", 600)),
         triage_new_incidents=bool(monitor.get("triage_new_incidents", True)),
-        assignee_user_id=str(monitor.get("assignee_user_id", DEFAULT_ASSIGNEE)),
+        assignee_user_id=parse_assignee_user_ids(monitor.get("assignee_user_id")),
+        assignee_aliases=parse_assignee_aliases(monitor.get("assignee_aliases")),
         codex=CodexConfig(
             command=str(codex.get("command", "codex")),
             model=str(codex.get("model", "")),
@@ -298,9 +349,42 @@ def extract_json(text: str) -> Any:
     raise ValueError("Codex output did not contain parseable JSON")
 
 
+def assignee_display(user_id: str, aliases: dict[str, str]) -> str:
+    alias = aliases.get(user_id)
+    return f"{alias} ({user_id})" if alias else user_id
+
+
+def assignee_filter_display(config: MonitorConfig) -> str:
+    if not config.assignee_user_id:
+        return "none"
+    aliases = config.assignee_aliases or {}
+    return ", ".join(assignee_display(user_id, aliases) for user_id in config.assignee_user_id)
+
+
+def assignee_prompt_list(config: MonitorConfig) -> str:
+    aliases = config.assignee_aliases or {}
+    return "\n".join(
+        f"- {user_id} ({aliases[user_id]})" if aliases.get(user_id) else f"- {user_id}"
+        for user_id in config.assignee_user_id
+    )
+
+
+def add_assignee_aliases(config: MonitorConfig, incidents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aliases = config.assignee_aliases or {}
+    enriched: list[dict[str, Any]] = []
+    for incident in incidents:
+        copied = dict(incident)
+        assigned_to = copied.get("assigned_to")
+        if assigned_to is not None:
+            copied["assignee_alias"] = aliases.get(str(assigned_to))
+        enriched.append(copied)
+    return enriched
+
+
 def poll_prompt(config: MonitorConfig) -> str:
     assignee_filter = (
-        f"Only include incidents whose Zenduty detail assigned_to exactly equals {config.assignee_user_id!r}."
+        "Only include incidents whose Zenduty detail assigned_to exactly equals one of these user IDs:\n"
+        f"{assignee_prompt_list(config)}"
         if config.assignee_user_id
         else "Do not filter by assignee."
     )
@@ -381,6 +465,7 @@ def normalize_incidents(payload: Any) -> list[dict[str, Any]]:
                 "creation_date": raw.get("creation_date"),
                 "urgency": raw.get("urgency"),
                 "assigned_to": raw.get("assigned_to"),
+                "assignee_alias": raw.get("assignee_alias"),
             }
         )
     return incidents
@@ -407,7 +492,9 @@ def write_status(
             "acknowledged": len(acknowledged),
             "open": len(triggered) + len(acknowledged),
         },
-        "assignee_user_id": config.assignee_user_id,
+        "assignee_user_id": list(config.assignee_user_id),
+        "assignee_aliases": config.assignee_aliases,
+        "assignee_filter": assignee_filter_display(config),
         "details_html": str(config.state_dir / "details.html"),
         "logs_dir": str(config.state_dir / "logs"),
         "incidents": incidents,
@@ -439,6 +526,11 @@ def write_details_html(
     runs = store.recent_runs() if store is not None else []
     rows = []
     for incident in incidents:
+        assigned_to = incident.get("assigned_to")
+        assignee_alias = incident.get("assignee_alias")
+        assigned_to_label = (
+            f"{assignee_alias} ({assigned_to})" if assignee_alias and assigned_to else assigned_to
+        )
         log_path = incident.get("triage_log_path")
         log_link = (
             f'<a href="file://{e(log_path)}">triage log</a>'
@@ -457,7 +549,7 @@ def write_details_html(
               </header>
               <dl>
                 <div><dt>Unique ID</dt><dd><code>{e(incident.get('unique_id'))}</code></dd></div>
-                <div><dt>Assigned To</dt><dd><code>{e(incident.get('assigned_to'))}</code></dd></div>
+                <div><dt>Assigned To</dt><dd><code>{e(assigned_to_label)}</code></dd></div>
                 <div><dt>Created</dt><dd>{e(incident.get('creation_date'))}</dd></div>
                 <div><dt>First Seen</dt><dd>{e(incident.get('first_seen_at'))}</dd></div>
                 <div><dt>Triage</dt><dd>{e(incident.get('triage_status', 'pending'))} · {log_link}</dd></div>
@@ -613,7 +705,7 @@ def write_details_html(
       <div>
         <h1>LANA Zenduty Monitor</h1>
         <p class="state"><span class="dot"></span>{e(status_label(color))}</p>
-        <p class="muted">Updated {e(status.get('updated_at'))} · Assignee filter <code>{e(status.get('assignee_user_id') or 'none')}</code></p>
+        <p class="muted">Updated {e(status.get('updated_at'))} · Assignee filter <code>{e(status.get('assignee_filter') or assignee_filter_display(config))}</code></p>
         {f'<p class="muted">Error: {e(status.get("error"))}</p>' if status.get("error") else ""}
       </div>
       <div class="counts">
@@ -661,7 +753,7 @@ def do_poll(config: MonitorConfig) -> int:
         if proc.returncode != 0:
             raise RuntimeError(f"codex exited with {proc.returncode}")
         payload = extract_json(proc.stdout)
-        incidents = normalize_incidents(payload)
+        incidents = add_assignee_aliases(config, normalize_incidents(payload))
         new_incidents = store.upsert_incidents(incidents)
         incidents = store.enrich_incidents(incidents)
         write_status(config, incidents, store=store)
@@ -693,7 +785,12 @@ def do_triage(config: MonitorConfig, incident_id: str, store: Store | None = Non
             "status": "triggered",
             "title": "",
             "creation_date": None,
-            "assigned_to": config.assignee_user_id or None,
+            "assigned_to": config.assignee_user_id[0] if config.assignee_user_id else None,
+            "assignee_alias": (
+                (config.assignee_aliases or {}).get(config.assignee_user_id[0])
+                if config.assignee_user_id
+                else None
+            ),
         }
 
     log_path = config.state_dir / "logs" / f"incident-{incident_id}-triage.md"
@@ -737,6 +834,7 @@ def refresh_status_from_disk(config: MonitorConfig, store: Store) -> None:
         return
     status = json.loads(status_path.read_text())
     incidents = normalize_incidents({"incidents": status.get("incidents", [])})
+    incidents = add_assignee_aliases(config, incidents)
     incidents = store.enrich_incidents(incidents)
     write_status(config, incidents, error=status.get("error"), store=store)
 

@@ -49,7 +49,12 @@ ls -la ~/.local/state/lana-zenduty-monitor
 ls -la ~/.local/state/lana-zenduty-monitor/logs
 ```
 
-The default assignee filter is `a7eecf16-e8fa-4903-90ea-8`.
+The assignee filter is read from `.env` by default:
+
+```sh
+LANA_ZENDUTY_ASSIGNEE_USER_IDS=zenduty-user-id-1,zenduty-user-id-2
+LANA_ZENDUTY_ASSIGNEE_ALIASES=zenduty-user-id-1=person@example.com,zenduty-user-id-2=other@example.com
+```
 
 Edit `~/.config/lana-zenduty-monitor/config.toml` to change the filter, polling interval, Codex command, or prompt behavior.
 
