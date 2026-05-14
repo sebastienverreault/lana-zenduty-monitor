@@ -14,6 +14,10 @@ concourse_failure_limit = 20
 # Drua's configured default team.
 zenduty_team_id = ""
 
+# Only this Zenduty schedule is authoritative for on-call gating.
+# Empty string evaluates all returned schedules.
+zenduty_schedule_name = "Primary Schedule"
+
 # Filter incidents by Zenduty assigned_to. Omit this to read from .env.
 # Empty list disables assignee filtering.
 # assignee_user_id = ["zenduty-user-id-1", "zenduty-user-id-2"]

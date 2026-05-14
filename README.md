@@ -64,7 +64,7 @@ LANA_ZENDUTY_ASSIGNEE_ALIASES=zenduty-user-id-1=person@example.com,zenduty-user-
 
 Edit `~/.config/lana-zenduty-monitor/config.toml` to change the filter, polling interval, Codex command, or prompt behavior.
 
-When an assignee filter is configured, `make poll` also checks Zenduty schedules through Drua before reporting Zenduty incidents. If the configured user is off schedule, Zenduty incident reporting and auto-triage are suppressed until the user is back on call. Set `monitor.zenduty_team_id` if Drua does not have a default Zenduty team configured.
+When an assignee filter is configured, `make poll` also checks Zenduty schedules through Drua before reporting Zenduty incidents. If the configured user is off schedule, Zenduty incident reporting and auto-triage are suppressed until the user is back on call. By default only `Primary Schedule` is authoritative; change `monitor.zenduty_schedule_name` if that schedule name changes. Set `monitor.zenduty_team_id` if Drua does not have a default Zenduty team configured.
 
 Dependabot pull request monitoring uses `gh pr list` against `GaloyMoney/lana-bank` by default. A PR is marked ready when it is open, not draft, and all reported checks completed successfully.
 

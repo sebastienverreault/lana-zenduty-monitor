@@ -47,6 +47,7 @@ class MonitorConfig:
     assignee_user_id: tuple[str, ...] = ()
     assignee_aliases: dict[str, str] | None = None
     zenduty_team_id: str = ""
+    zenduty_schedule_name: str = "Primary Schedule"
     dependabot_repo: str = DEFAULT_DEPENDABOT_REPO
     dependabot_pr_limit: int = 50
     concourse_url: str = DEFAULT_CONCOURSE_URL
@@ -162,6 +163,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MonitorConfig:
         assignee_user_id=parse_assignee_user_ids(monitor.get("assignee_user_id")),
         assignee_aliases=parse_assignee_aliases(monitor.get("assignee_aliases")),
         zenduty_team_id=str(monitor.get("zenduty_team_id", "")).strip(),
+        zenduty_schedule_name=str(monitor.get("zenduty_schedule_name", "Primary Schedule")).strip(),
         dependabot_repo=str(monitor.get("dependabot_repo", DEFAULT_DEPENDABOT_REPO)),
         dependabot_pr_limit=int(monitor.get("dependabot_pr_limit", 50)),
         concourse_url=str(monitor.get("concourse_url", DEFAULT_CONCOURSE_URL)).rstrip("/"),
@@ -453,6 +455,15 @@ def zenduty_team_prompt(config: MonitorConfig) -> str:
     return "Omit team_id so Drua uses its configured Zenduty default team."
 
 
+def zenduty_schedule_prompt(config: MonitorConfig) -> str:
+    if config.zenduty_schedule_name:
+        return (
+            f'Only evaluate the Zenduty schedule whose name exactly equals '
+            f'"{config.zenduty_schedule_name}". Ignore all other schedules.'
+        )
+    return "Evaluate all returned Zenduty schedules."
+
+
 def add_assignee_aliases(config: MonitorConfig, incidents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     aliases = config.assignee_aliases or {}
     enriched: list[dict[str, Any]] = []
@@ -613,8 +624,10 @@ def poll_prompt(config: MonitorConfig) -> str:
             f"""
             First establish whether the configured Zenduty user is currently on schedule.
             {zenduty_team_prompt(config)}
-            Call zenduty_list_schedules, then call zenduty_get_schedule for each schedule unique_id
-            until you can determine whether one of these user IDs is currently on call:
+            Call zenduty_list_schedules, then select the relevant schedule.
+            {zenduty_schedule_prompt(config)}
+            Call zenduty_get_schedule only for the selected schedule unique_id, then determine
+            whether one of these user IDs is currently on call:
             {assignee_prompt_list(config)}
             Match those IDs against on_call_now entries and nested user fields such as unique_id, id,
             user_id, user.unique_id, user.id, and member.unique_id. If on_call_now does not include
@@ -675,6 +688,7 @@ def poll_prompt(config: MonitorConfig) -> str:
             "matched_alias": "<alias or null>",
             "schedule_id": "<Zenduty schedule unique_id or null>",
             "schedule_name": "<schedule name or null>",
+            "configured_schedule_name": "{config.zenduty_schedule_name}",
             "window_start": "<UTC/local ISO-8601 timestamp or null>",
             "window_end": "<UTC/local ISO-8601 timestamp or null>",
             "timezone": "<schedule time_zone or null>",
@@ -769,6 +783,7 @@ def schedule_default(config: MonitorConfig) -> dict[str, Any]:
         "matched_alias": None,
         "schedule_id": None,
         "schedule_name": None,
+        "configured_schedule_name": config.zenduty_schedule_name or None,
         "window_start": None,
         "window_end": None,
         "timezone": None,
@@ -812,6 +827,7 @@ def normalize_schedule(payload: Any, config: MonitorConfig) -> dict[str, Any]:
         "matched_alias",
         "schedule_id",
         "schedule_name",
+        "configured_schedule_name",
         "window_start",
         "window_end",
         "timezone",
