@@ -64,6 +64,8 @@ LANA_ZENDUTY_ASSIGNEE_ALIASES=zenduty-user-id-1=person@example.com,zenduty-user-
 
 Edit `~/.config/lana-zenduty-monitor/config.toml` to change the filter, polling interval, Codex command, or prompt behavior.
 
+When an assignee filter is configured, `make poll` also checks Zenduty schedules through Drua before reporting Zenduty incidents. If the configured user is off schedule, Zenduty incident reporting and auto-triage are suppressed until the user is back on call. Set `monitor.zenduty_team_id` if Drua does not have a default Zenduty team configured.
+
 Dependabot pull request monitoring uses `gh pr list` against `GaloyMoney/lana-bank` by default. A PR is marked ready when it is open, not draft, and all reported checks completed successfully.
 
 Concourse monitoring uses Drua's Concourse MCP tools against `https://ci.galoy.io/`. It lists active pipelines, finds failed/errored/aborted jobs, and records latest build metadata, resources, CI links, and compact log summaries.
@@ -73,7 +75,7 @@ Concourse monitoring uses Drua's Concourse MCP tools against `https://ci.galoy.i
 - Red: at least one filtered `triggered` incident or failed Concourse job
 - Yellow: no triggered incidents, but at least one filtered `acknowledged` incident
 - Blue: no filtered open incidents, and at least one Dependabot PR is ready to merge
-- Green: no filtered open incidents
+- Green: no filtered open incidents, or Zenduty incident reporting is off schedule
 - Gray: monitor has not produced status yet or the status file cannot be read
 
 ## Files
@@ -107,7 +109,7 @@ For Concourse, `make poll` uses `concourse_list_pipelines`, `concourse_list_jobs
 
 ## Details UI
 
-The GNOME extension popup shows current counts, up to eight open incidents, Concourse failures, Dependabot PR readiness, and actions:
+The GNOME extension popup shows current counts, schedule state, up to eight open incidents, Concourse failures, Dependabot PR readiness, and actions:
 
 - `Open details`: opens `~/.local/state/lana-zenduty-monitor/details.html`
 - `Open logs`: opens the transcript directory

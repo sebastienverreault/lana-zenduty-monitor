@@ -10,6 +10,10 @@ dependabot_pr_limit = 50
 concourse_url = "https://ci.galoy.io"
 concourse_failure_limit = 20
 
+# Optional Zenduty team for schedule and incident queries. Leave empty to use
+# Drua's configured default team.
+zenduty_team_id = ""
+
 # Filter incidents by Zenduty assigned_to. Omit this to read from .env.
 # Empty list disables assignee filtering.
 # assignee_user_id = ["zenduty-user-id-1", "zenduty-user-id-2"]

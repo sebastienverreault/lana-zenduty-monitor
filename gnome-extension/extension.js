@@ -68,6 +68,11 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         });
         this.menu.addMenuItem(this._summaryItem);
 
+        this._scheduleItem = new PopupMenu.PopupMenuItem('Schedule: unknown', {
+            reactive: false,
+        });
+        this.menu.addMenuItem(this._scheduleItem);
+
         this._incidentSection = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._incidentSection);
 
@@ -165,6 +170,16 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         });
     }
 
+    _scheduleText(schedule) {
+        if (!schedule || schedule.enabled === false)
+            return 'Schedule: disabled';
+        const state = schedule.status || (
+            schedule.on_call === true ? 'on' : schedule.on_call === false ? 'off' : 'unknown'
+        );
+        const summary = schedule.summary || '';
+        return `Schedule: ${state}${summary ? ` · ${summary}` : ''}`;
+    }
+
     _applyStatus(status) {
         const color = status.color || 'gray';
         const counts = status.counts || {};
@@ -173,20 +188,28 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         const dependabotReady = counts.dependabot_ready || 0;
         const dependabotOpen = counts.dependabot_open || 0;
         const concourseFailed = counts.concourse_failed || 0;
+        const schedule = status.schedule || {};
+        const scheduleText = this._scheduleText(schedule);
 
         this._setIconColor(color);
 
         const updated = status.updated_at || 'never';
         const error = status.error ? ` error: ${status.error}` : '';
+        const zendutyError = status.zenduty_error ? ` zenduty error: ${status.zenduty_error}` : '';
         const dependabotError = status.dependabot_error ? ` dependabot error: ${status.dependabot_error}` : '';
         const concourseError = status.concourse_error ? ` concourse error: ${status.concourse_error}` : '';
         this._summaryItem.label.text =
-            `Zenduty: ${triggered} triggered · ${acknowledged} acknowledged  Updated: ${updated}${error}${dependabotError}${concourseError}`;
+            `Zenduty: ${triggered} triggered · ${acknowledged} acknowledged · ${scheduleText}  Updated: ${updated}${error}${zendutyError}${dependabotError}${concourseError}`;
+        this._scheduleItem.label.text = scheduleText;
 
         this._incidentSection.removeAll();
         const incidents = status.incidents || [];
         if (incidents.length === 0) {
-            this._incidentSection.addMenuItem(new PopupMenu.PopupMenuItem('No filtered open incidents', {
+            const suppressed = counts.schedule_suppressed || 0;
+            const emptyText = schedule.enabled !== false && schedule.on_call === false ?
+                `No filtered open incidents · off schedule${suppressed ? ` (${suppressed} hidden)` : ''}` :
+                'No filtered open incidents';
+            this._incidentSection.addMenuItem(new PopupMenu.PopupMenuItem(emptyText, {
                 reactive: false,
             }));
         } else {
@@ -280,7 +303,7 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         const concourse = status.concourse || {};
         const concourseSnooze = concourse.snooze || {};
         const concourseFailed = concourseSnooze.active ? 0 : (counts.concourse_failed || 0);
-        const error = status.error || status.dependabot_error || status.concourse_error || '';
+        const error = status.error || status.zenduty_error || status.dependabot_error || status.concourse_error || '';
         if (!triggered && !acknowledged && !dependabotReady && !concourseFailed && !error)
             return null;
         return [

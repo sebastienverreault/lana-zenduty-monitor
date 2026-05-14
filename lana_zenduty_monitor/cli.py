@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import html
 import json
 import os
@@ -45,6 +46,7 @@ class MonitorConfig:
     triage_new_incidents: bool = True
     assignee_user_id: tuple[str, ...] = ()
     assignee_aliases: dict[str, str] | None = None
+    zenduty_team_id: str = ""
     dependabot_repo: str = DEFAULT_DEPENDABOT_REPO
     dependabot_pr_limit: int = 50
     concourse_url: str = DEFAULT_CONCOURSE_URL
@@ -159,6 +161,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MonitorConfig:
         triage_new_incidents=bool(monitor.get("triage_new_incidents", True)),
         assignee_user_id=parse_assignee_user_ids(monitor.get("assignee_user_id")),
         assignee_aliases=parse_assignee_aliases(monitor.get("assignee_aliases")),
+        zenduty_team_id=str(monitor.get("zenduty_team_id", "")).strip(),
         dependabot_repo=str(monitor.get("dependabot_repo", DEFAULT_DEPENDABOT_REPO)),
         dependabot_pr_limit=int(monitor.get("dependabot_pr_limit", 50)),
         concourse_url=str(monitor.get("concourse_url", DEFAULT_CONCOURSE_URL)).rstrip("/"),
@@ -387,6 +390,19 @@ def run_codex(config: MonitorConfig, prompt: str, log_path: Path) -> subprocess.
     return proc
 
 
+def acquire_poll_lock(config: MonitorConfig):
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = (config.state_dir / "poll.lock").open("w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+    lock_file.write(f"{os.getpid()}\n")
+    lock_file.flush()
+    return lock_file
+
+
 def extract_json(text: str) -> Any:
     stripped = text.strip()
     if stripped.startswith("{") or stripped.startswith("["):
@@ -429,6 +445,12 @@ def assignee_prompt_list(config: MonitorConfig) -> str:
         f"- {user_id} ({aliases[user_id]})" if aliases.get(user_id) else f"- {user_id}"
         for user_id in config.assignee_user_id
     )
+
+
+def zenduty_team_prompt(config: MonitorConfig) -> str:
+    if config.zenduty_team_id:
+        return f'Pass team_id exactly "{config.zenduty_team_id}" to schedule and incident tools.'
+    return "Omit team_id so Drua uses its configured Zenduty default team."
 
 
 def add_assignee_aliases(config: MonitorConfig, incidents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -560,6 +582,25 @@ def normalize_concourse_failures(
     return failures, None
 
 
+def payload_error(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def zenduty_error_from_run(payload: dict[str, Any], proc: subprocess.CompletedProcess[str]) -> str | None:
+    zenduty_error = payload_error(payload, "zenduty_error")
+    if zenduty_error:
+        return zenduty_error
+
+    incidents = payload.get("incidents")
+    if incidents == [] and "ToolSetsError - Zenduty:" in proc.stderr:
+        return "Zenduty MCP tool failed; see the poll log for details."
+    return None
+
+
 def poll_prompt(config: MonitorConfig) -> str:
     assignee_filter = (
         "Only include incidents whose Zenduty detail assigned_to exactly equals one of these user IDs:\n"
@@ -567,20 +608,48 @@ def poll_prompt(config: MonitorConfig) -> str:
         if config.assignee_user_id
         else "Do not filter by assignee."
     )
+    schedule_check = (
+        textwrap.dedent(
+            f"""
+            First establish whether the configured Zenduty user is currently on schedule.
+            {zenduty_team_prompt(config)}
+            Call zenduty_list_schedules, then call zenduty_get_schedule for each schedule unique_id
+            until you can determine whether one of these user IDs is currently on call:
+            {assignee_prompt_list(config)}
+            Match those IDs against on_call_now entries and nested user fields such as unique_id, id,
+            user_id, user.unique_id, user.id, and member.unique_id. If on_call_now does not include
+            enough timing information, inspect layers and overrides to find the active window at the
+            current UTC time. Include the best window_start/window_end you can infer, preserving the
+            schedule time_zone when available.
+
+            If the schedule API fails, still attempt the incident and Concourse checks, but include
+            schedule.error with the exact tool error summary.
+            If schedule.on_call is false, do not list Zenduty incidents; return incidents as [] and
+            do not set zenduty_error for skipped incident listing.
+            """
+        ).strip()
+        if config.assignee_user_id
+        else "Set schedule.enabled to false, schedule.on_call to true, and do not call schedule tools because no assignee filter is configured."
+    )
     return textwrap.dedent(
         f"""
         Use MCP Drua Zenduty tools from this Codex session.
+
+        {schedule_check}
 
         List open Zenduty incidents by calling zenduty_list_incidents twice:
         - once with statuses exactly ["triggered"]
         - once with statuses exactly ["acknowledged"]
         Do not rely on the tool's default statuses, and do not combine status names in one call.
+        {zenduty_team_prompt(config)}
         Fetch detail records as needed to include assigned_to and to apply the assignee filter.
         For incidents whose title starts with "[HoneyComb]" or whose detail summary contains a Honeycomb URL:
         - include the Zenduty detail summary in "summary"
         - extract all Honeycomb URLs into "honeycomb_urls"
         - call honeycomb_get_query_results with the first Honeycomb URL and include a compact text summary in "honeycomb_query_results"
         {assignee_filter}
+        If any Zenduty incident or incident-detail call fails, do not guess or return an empty
+        incidents list as success. Instead return "zenduty_error" with the exact tool error summary.
 
         Also inspect Concourse at https://ci.galoy.io/ using MCP Drua Concourse tools:
         - call concourse_list_pipelines
@@ -595,6 +664,23 @@ def poll_prompt(config: MonitorConfig) -> str:
         Return only valid JSON, with no markdown and no prose:
         {{
           "checked_at": "<UTC ISO-8601 timestamp>",
+          "zenduty_error": null,
+          "schedule": {{
+            "enabled": true,
+            "on_call": true,
+            "status": "on",
+            "team_id": "{config.zenduty_team_id}",
+            "user_ids": {json.dumps(list(config.assignee_user_id))},
+            "matched_user_id": "<matched Zenduty user id or null>",
+            "matched_alias": "<alias or null>",
+            "schedule_id": "<Zenduty schedule unique_id or null>",
+            "schedule_name": "<schedule name or null>",
+            "window_start": "<UTC/local ISO-8601 timestamp or null>",
+            "window_end": "<UTC/local ISO-8601 timestamp or null>",
+            "timezone": "<schedule time_zone or null>",
+            "summary": "On schedule until ...",
+            "error": null
+          }},
           "incidents": [
             {{
               "unique_id": "<Zenduty unique_id>",
@@ -671,6 +757,100 @@ def triage_prompt(incident: dict[str, Any]) -> str:
     ).strip()
 
 
+def schedule_default(config: MonitorConfig) -> dict[str, Any]:
+    enabled = bool(config.assignee_user_id)
+    return {
+        "enabled": enabled,
+        "on_call": True if not enabled else None,
+        "status": "disabled" if not enabled else "unknown",
+        "team_id": config.zenduty_team_id or None,
+        "user_ids": list(config.assignee_user_id),
+        "matched_user_id": None,
+        "matched_alias": None,
+        "schedule_id": None,
+        "schedule_name": None,
+        "window_start": None,
+        "window_end": None,
+        "timezone": None,
+        "summary": (
+            "Schedule check disabled; no assignee filter is configured."
+            if not enabled
+            else "Schedule check pending."
+        ),
+        "error": None,
+        "suppressed_incident_count": 0,
+    }
+
+
+def normalize_schedule(payload: Any, config: MonitorConfig) -> dict[str, Any]:
+    schedule = schedule_default(config)
+    if not isinstance(payload, dict):
+        return schedule
+
+    enabled = bool(payload.get("enabled", schedule["enabled"]))
+    schedule["enabled"] = enabled
+    schedule["team_id"] = payload.get("team_id") or schedule["team_id"]
+    schedule["user_ids"] = (
+        [str(user_id) for user_id in payload.get("user_ids", []) if str(user_id).strip()]
+        if isinstance(payload.get("user_ids"), list)
+        else schedule["user_ids"]
+    )
+
+    on_call = payload.get("on_call")
+    if isinstance(on_call, bool):
+        schedule["on_call"] = on_call
+        schedule["status"] = "on" if on_call else "off"
+    elif not enabled:
+        schedule["on_call"] = True
+        schedule["status"] = "disabled"
+    else:
+        schedule["on_call"] = None
+        schedule["status"] = "unknown"
+
+    for key in [
+        "matched_user_id",
+        "matched_alias",
+        "schedule_id",
+        "schedule_name",
+        "window_start",
+        "window_end",
+        "timezone",
+        "summary",
+        "error",
+    ]:
+        if payload.get(key) is not None:
+            schedule[key] = str(payload[key])
+
+    if not schedule.get("matched_alias") and schedule.get("matched_user_id"):
+        schedule["matched_alias"] = (config.assignee_aliases or {}).get(
+            str(schedule["matched_user_id"])
+        )
+
+    try:
+        schedule["suppressed_incident_count"] = max(
+            0, int(payload.get("suppressed_incident_count", 0))
+        )
+    except (TypeError, ValueError):
+        schedule["suppressed_incident_count"] = 0
+
+    if not schedule.get("summary"):
+        if schedule["status"] == "on":
+            until = f" until {schedule['window_end']}" if schedule.get("window_end") else ""
+            schedule["summary"] = f"On schedule{until}."
+        elif schedule["status"] == "off":
+            schedule["summary"] = "Off schedule."
+        elif schedule.get("error"):
+            schedule["summary"] = "Schedule check failed."
+        else:
+            schedule["summary"] = schedule_default(config)["summary"]
+
+    return schedule
+
+
+def schedule_blocks_reporting(schedule: dict[str, Any]) -> bool:
+    return bool(schedule.get("enabled")) and schedule.get("on_call") is False
+
+
 def normalize_incidents(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("incidents"), list):
         raise ValueError("Expected JSON object with incidents array")
@@ -701,13 +881,19 @@ def write_status(
     incidents: list[dict[str, Any]],
     dependabot_prs: list[dict[str, Any]] | None = None,
     concourse_failures: list[dict[str, Any]] | None = None,
+    schedule: dict[str, Any] | None = None,
     error: str | None = None,
     dependabot_error: str | None = None,
     concourse_error: str | None = None,
+    zenduty_error: str | None = None,
     store: Store | None = None,
 ) -> None:
     dependabot_prs = dependabot_prs or []
     concourse_failures = concourse_failures or []
+    schedule = normalize_schedule(schedule, config)
+    if schedule_blocks_reporting(schedule) and incidents:
+        schedule["suppressed_incident_count"] = len(incidents)
+        incidents = []
     triggered = [i for i in incidents if i.get("status") == "triggered"]
     acknowledged = [i for i in incidents if i.get("status") == "acknowledged"]
     ready_dependabot_prs = [pr for pr in dependabot_prs if pr.get("ready_to_merge")]
@@ -722,13 +908,14 @@ def write_status(
         if ready_dependabot_prs
         else "green"
     )
-    if error:
+    if error or zenduty_error:
         color = "gray"
 
     status = {
         "updated_at": utc_now(),
         "color": color,
         "error": error,
+        "zenduty_error": zenduty_error,
         "dependabot_error": dependabot_error,
         "concourse_error": concourse_error,
         "counts": {
@@ -739,7 +926,9 @@ def write_status(
             "dependabot_ready": len(ready_dependabot_prs),
             "concourse_failed": len(concourse_failures),
             "concourse_unsnoozed_failed": len(active_concourse_failures),
+            "schedule_suppressed": int(schedule.get("suppressed_incident_count") or 0),
         },
+        "schedule": schedule,
         "dependabot": {
             "repo": config.dependabot_repo,
             "open": len(dependabot_prs),
@@ -791,6 +980,7 @@ def write_details_html(
     concourse = status.get("concourse", {})
     concourse_failures = concourse.get("failures", []) if isinstance(concourse, dict) else []
     concourse_snooze = concourse.get("snooze", {}) if isinstance(concourse, dict) else {}
+    schedule = normalize_schedule(status.get("schedule"), config)
     runs = store.recent_runs() if store is not None else []
     rows = []
     for incident in incidents:
@@ -914,7 +1104,14 @@ def write_details_html(
             f"<td>{e(run.get('error'))}</td></tr>"
         )
 
-    body = "\n".join(rows) or '<p class="empty">No filtered open incidents.</p>'
+    schedule_note = ""
+    if schedule_blocks_reporting(schedule):
+        suppressed = int(schedule.get("suppressed_incident_count") or 0)
+        schedule_note = (
+            f" Zenduty incident reporting is suppressed while off schedule"
+            f"{f' ({suppressed} hidden)' if suppressed else ''}."
+        )
+    body = "\n".join(rows) or f'<p class="empty">No filtered open incidents.{e(schedule_note)}</p>'
     prs_body = "\n".join(pr_rows) or '<p class="empty">No open Dependabot PRs.</p>'
     concourse_body = "\n".join(concourse_rows) or '<p class="empty">No failed Concourse jobs.</p>'
     concourse_snooze_note = (
@@ -1064,7 +1261,10 @@ def write_details_html(
         <h1>LANA Zenduty Monitor</h1>
         <p class="state"><span class="dot"></span>{e(status_label(color))}</p>
         <p class="muted">Updated {e(status.get('updated_at'))} · Assignee filter <code>{e(status.get('assignee_filter') or assignee_filter_display(config))}</code></p>
+        <p class="muted">Schedule: <strong>{e(schedule.get('status'))}</strong> · {e(schedule.get('summary'))}</p>
         {f'<p class="muted">Error: {e(status.get("error"))}</p>' if status.get("error") else ""}
+        {f'<p class="muted">Zenduty error: {e(status.get("zenduty_error"))}</p>' if status.get("zenduty_error") else ""}
+        {f'<p class="muted">Schedule error: {e(schedule.get("error"))}</p>' if schedule.get("error") else ""}
       </div>
       <div class="counts">
         <div class="count"><strong>{e(counts.get('triggered', 0))}</strong><span>Triggered</span></div>
@@ -1116,6 +1316,10 @@ def status_default(config: MonitorConfig) -> None:
 
 
 def do_poll(config: MonitorConfig) -> int:
+    lock_file = acquire_poll_lock(config)
+    if lock_file is None:
+        print("poll skipped: another poll is already running")
+        return 0
     store = Store(config.state_dir)
     log_path = config.state_dir / "logs" / f"{utc_now().replace(':', '').replace('-', '')}-poll.md"
     run_id = store.begin_run("poll", log_path)
@@ -1124,9 +1328,16 @@ def do_poll(config: MonitorConfig) -> int:
         if proc.returncode != 0:
             raise RuntimeError(f"codex exited with {proc.returncode}")
         payload = extract_json(proc.stdout)
-        incidents = add_assignee_aliases(config, normalize_incidents(payload))
+        if not isinstance(payload, dict):
+            raise ValueError("Expected JSON object from Codex poll")
+        zenduty_error = zenduty_error_from_run(payload, proc)
+        schedule = normalize_schedule(payload.get("schedule"), config)
+        incidents = [] if zenduty_error else add_assignee_aliases(config, normalize_incidents(payload))
+        if schedule_blocks_reporting(schedule) and incidents:
+            schedule["suppressed_incident_count"] = len(incidents)
+            incidents = []
         concourse_failures, concourse_error = normalize_concourse_failures(
-            payload.get("concourse_failures") if isinstance(payload, dict) else None,
+            payload.get("concourse_failures"),
             config,
         )
         dependabot_prs, dependabot_error = fetch_dependabot_prs(config)
@@ -1137,11 +1348,13 @@ def do_poll(config: MonitorConfig) -> int:
             incidents,
             dependabot_prs=dependabot_prs,
             concourse_failures=concourse_failures,
+            schedule=schedule,
             dependabot_error=dependabot_error,
             concourse_error=concourse_error,
+            zenduty_error=zenduty_error,
             store=store,
         )
-        store.finish_run(run_id, True)
+        store.finish_run(run_id, zenduty_error is None, zenduty_error)
 
         print(
             json.dumps(
@@ -1155,14 +1368,16 @@ def do_poll(config: MonitorConfig) -> int:
                     "dependabot_error": dependabot_error,
                     "concourse_failed": len(concourse_failures),
                     "concourse_error": concourse_error,
+                    "schedule": schedule,
+                    "zenduty_error": zenduty_error,
                 },
                 indent=2,
             )
         )
-        if config.triage_new_incidents:
+        if config.triage_new_incidents and zenduty_error is None:
             for incident in new_incidents:
                 do_triage(config, incident["unique_id"], store=store)
-        return 0
+        return 1 if zenduty_error else 0
     except Exception as exc:
         write_status(config, [], error=str(exc), store=store)
         store.finish_run(run_id, False, str(exc))
@@ -1170,6 +1385,8 @@ def do_poll(config: MonitorConfig) -> int:
         return 1
     finally:
         store.close()
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def do_triage(config: MonitorConfig, incident_id: str, store: Store | None = None) -> int:
@@ -1246,9 +1463,11 @@ def refresh_status_from_disk(config: MonitorConfig, store: Store) -> None:
         incidents,
         dependabot_prs=dependabot_prs,
         concourse_failures=concourse_failures,
+        schedule=normalize_schedule(status.get("schedule"), config),
         error=status.get("error"),
         dependabot_error=status.get("dependabot_error"),
         concourse_error=status.get("concourse_error"),
+        zenduty_error=status.get("zenduty_error"),
         store=store,
     )
 
