@@ -821,6 +821,14 @@ def normalize_schedule(payload: Any, config: MonitorConfig) -> dict[str, Any]:
         if payload.get(key) is not None:
             schedule[key] = str(payload[key])
 
+    summary_times = re.findall(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?",
+        str(schedule.get("summary") or ""),
+    )
+    if not schedule.get("window_start") and not schedule.get("window_end") and len(summary_times) >= 2:
+        schedule["window_start"] = iso_time_value(summary_times[-2])
+        schedule["window_end"] = iso_time_value(summary_times[-1])
+
     if not schedule.get("matched_alias") and schedule.get("matched_user_id"):
         schedule["matched_alias"] = (config.assignee_aliases or {}).get(
             str(schedule["matched_user_id"])
@@ -959,6 +967,30 @@ def e(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def iso_time_value(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), timezone.utc).isoformat().replace("+00:00", "Z")
+        except (OverflowError, OSError, ValueError):
+            return str(value)
+    text = str(value)
+    parsed = parse_utc(text)
+    if parsed:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return text
+
+
+def time_span(value: Any) -> str:
+    iso = iso_time_value(value)
+    if not iso:
+        return ""
+    return f'<time data-time="{e(iso)}">{e(iso)}</time>'
+
+
 def status_label(color: str) -> str:
     return {
         "red": "Incidents or CI failures",
@@ -1022,8 +1054,8 @@ def write_details_html(
               <dl>
                 <div><dt>Unique ID</dt><dd><code>{e(incident.get('unique_id'))}</code></dd></div>
                 <div><dt>Assigned To</dt><dd><code>{e(assigned_to_label)}</code></dd></div>
-                <div><dt>Created</dt><dd>{e(incident.get('creation_date'))}</dd></div>
-                <div><dt>First Seen</dt><dd>{e(incident.get('first_seen_at'))}</dd></div>
+                <div><dt>Created</dt><dd>{time_span(incident.get('creation_date')) or e(incident.get('creation_date'))}</dd></div>
+                <div><dt>First Seen</dt><dd>{time_span(incident.get('first_seen_at')) or e(incident.get('first_seen_at'))}</dd></div>
                 <div><dt>Triage</dt><dd>{e(incident.get('triage_status', 'pending'))} · {log_link}</dd></div>
               </dl>
               <section>
@@ -1054,7 +1086,7 @@ def write_details_html(
               <dl>
                 <div><dt>Checks</dt><dd>{e(counts.get('success', 0))} ok · {e(counts.get('failure', 0))} failed · {e(counts.get('pending', 0))} pending</dd></div>
                 <div><dt>Merge State</dt><dd><code>{e(pr.get('merge_state'))}</code></dd></div>
-                <div><dt>Updated</dt><dd>{e(pr.get('updated_at'))}</dd></div>
+                <div><dt>Updated</dt><dd>{time_span(pr.get('updated_at')) or e(pr.get('updated_at'))}</dd></div>
               </dl>
             </article>
             """
@@ -1084,8 +1116,8 @@ def write_details_html(
               <dl>
                 <div><dt>Team</dt><dd>{e(failure.get('team'))}</dd></div>
                 <div><dt>Build</dt><dd><code>{e(failure.get('build_name') or failure.get('build_id'))}</code></dd></div>
-                <div><dt>Started</dt><dd>{e(failure.get('start_time'))}</dd></div>
-                <div><dt>Finished</dt><dd>{e(failure.get('end_time'))}</dd></div>
+                <div><dt>Started</dt><dd>{time_span(failure.get('start_time')) or e(failure.get('start_time'))}</dd></div>
+                <div><dt>Finished</dt><dd>{time_span(failure.get('end_time')) or e(failure.get('end_time'))}</dd></div>
               </dl>
               {f'<pre>{e(resource_text)}</pre>' if resource_text else ''}
               {f'<pre>{e(failure.get("log_summary"))}</pre>' if failure.get("log_summary") else ''}
@@ -1099,8 +1131,8 @@ def write_details_html(
         log_path = run.get("log_path")
         log_link = f'<a href="file://{e(log_path)}">log</a>' if log_path else ""
         run_rows.append(
-            f"<tr><td>{e(run.get('kind'))}</td><td>{e(run.get('started_at'))}</td>"
-            f"<td>{e(run.get('finished_at'))}</td><td>{success}</td><td>{log_link}</td>"
+            f"<tr><td>{e(run.get('kind'))}</td><td>{time_span(run.get('started_at')) or e(run.get('started_at'))}</td>"
+            f"<td>{time_span(run.get('finished_at')) or e(run.get('finished_at'))}</td><td>{success}</td><td>{log_link}</td>"
             f"<td>{e(run.get('error'))}</td></tr>"
         )
 
@@ -1111,6 +1143,16 @@ def write_details_html(
             f" Zenduty incident reporting is suppressed while off schedule"
             f"{f' ({suppressed} hidden)' if suppressed else ''}."
         )
+    schedule_window = ""
+    if schedule.get("window_start") and schedule.get("window_end"):
+        schedule_window = (
+            f' · Window {time_span(schedule.get("window_start"))} to '
+            f'{time_span(schedule.get("window_end"))}'
+        )
+    elif schedule.get("window_end"):
+        schedule_window = f' · Until {time_span(schedule.get("window_end"))}'
+    elif schedule.get("window_start"):
+        schedule_window = f' · From {time_span(schedule.get("window_start"))}'
     body = "\n".join(rows) or f'<p class="empty">No filtered open incidents.{e(schedule_note)}</p>'
     prs_body = "\n".join(pr_rows) or '<p class="empty">No open Dependabot PRs.</p>'
     concourse_body = "\n".join(concourse_rows) or '<p class="empty">No failed Concourse jobs.</p>'
@@ -1172,6 +1214,22 @@ def write_details_html(
       gap: 8px;
       font-weight: 700;
     }}
+    .toolbar {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    button {{
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 6px 10px;
+      font: inherit;
+      cursor: pointer;
+    }}
+    button:hover {{ border-color: var(--muted); }}
     .dot {{
       width: 12px;
       height: 12px;
@@ -1259,9 +1317,12 @@ def write_details_html(
     <section class="top">
       <div>
         <h1>LANA Zenduty Monitor</h1>
-        <p class="state"><span class="dot"></span>{e(status_label(color))}</p>
-        <p class="muted">Updated {e(status.get('updated_at'))} · Assignee filter <code>{e(status.get('assignee_filter') or assignee_filter_display(config))}</code></p>
-        <p class="muted">Schedule: <strong>{e(schedule.get('status'))}</strong> · {e(schedule.get('summary'))}</p>
+        <div class="toolbar">
+          <p class="state"><span class="dot"></span>{e(status_label(color))}</p>
+          <button id="time-toggle" type="button">Show UTC</button>
+        </div>
+        <p class="muted">Updated {time_span(status.get('updated_at'))} · Assignee filter <code>{e(status.get('assignee_filter') or assignee_filter_display(config))}</code></p>
+        <p class="muted">Schedule: <strong>{e(schedule.get('status'))}</strong>{schedule_window}</p>
         {f'<p class="muted">Error: {e(status.get("error"))}</p>' if status.get("error") else ""}
         {f'<p class="muted">Zenduty error: {e(status.get("zenduty_error"))}</p>' if status.get("zenduty_error") else ""}
         {f'<p class="muted">Schedule error: {e(schedule.get("error"))}</p>' if schedule.get("error") else ""}
@@ -1296,6 +1357,35 @@ def write_details_html(
       </div>
     </section>
   </main>
+  <script>
+    const pad = value => String(value).padStart(2, '0');
+    const formatLocal = date => {{
+      const offset = -date.getTimezoneOffset();
+      const sign = offset >= 0 ? '+' : '-';
+      const offsetHours = pad(Math.floor(Math.abs(offset) / 60));
+      const offsetMinutes = pad(Math.abs(offset) % 60);
+      return `${{date.getFullYear()}}-${{pad(date.getMonth() + 1)}}-${{pad(date.getDate())}} ` +
+        `${{pad(date.getHours())}}:${{pad(date.getMinutes())}} UTC${{sign}}${{offsetHours}}:${{offsetMinutes}}`;
+    }};
+    let useUtc = false;
+    const renderTimes = () => {{
+      document.querySelectorAll('[data-time]').forEach(node => {{
+        const raw = node.getAttribute('data-time');
+        const date = new Date(raw);
+        node.textContent = Number.isNaN(date.getTime())
+          ? raw
+          : useUtc
+            ? date.toISOString().replace('.000Z', 'Z')
+            : formatLocal(date);
+      }});
+      document.getElementById('time-toggle').textContent = useUtc ? 'Show local time' : 'Show UTC';
+    }};
+    document.getElementById('time-toggle').addEventListener('click', () => {{
+      useUtc = !useUtc;
+      renderTimes();
+    }});
+    renderTimes();
+  </script>
 </body>
 </html>
 """
