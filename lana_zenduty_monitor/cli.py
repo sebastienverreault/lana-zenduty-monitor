@@ -27,6 +27,8 @@ DEFAULT_DEPENDABOT_REPO = "GaloyMoney/lana-bank"
 DEFAULT_CONCOURSE_URL = "https://ci.galoy.io"
 CONCOURSE_FAILURE_STATUSES = {"failed", "errored", "aborted"}
 SUCCESSFUL_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+BUG_CLASSIFICATIONS = {"bug_possible", "real_problem"}
+FALSE_POSITIVE_CLASSIFICATIONS = {"false_positive", "no_bug"}
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,14 @@ class MonitorConfig:
     poll_interval_seconds: int = 300
     codex_timeout_seconds: int = 600
     triage_new_incidents: bool = True
+    auto_acknowledge: bool = True
+    auto_resolve_false_positive: bool = False
+    auto_fix_bug_possible: bool = True
+    drua_shadow_enabled: bool = True
+    auto_drua_debug_bug_possible: bool = True
+    fix_root_dir: Path | None = None
+    triage_max_attempts: int = 2
+    fix_max_attempts: int = 3
     assignee_user_id: tuple[str, ...] = ()
     assignee_aliases: dict[str, str] | None = None
     zenduty_team_id: str = ""
@@ -58,6 +68,8 @@ class MonitorConfig:
     def __post_init__(self) -> None:
         if self.assignee_aliases is None:
             object.__setattr__(self, "assignee_aliases", {})
+        if self.fix_root_dir is None:
+            object.__setattr__(self, "fix_root_dir", self.state_dir / "fixes")
 
 
 def split_env_list(value: str) -> tuple[str, ...]:
@@ -154,12 +166,21 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MonitorConfig:
     monitor = data.get("monitor", {})
     codex = data.get("codex", {})
 
+    state_dir = Path(monitor.get("state_dir", DEFAULT_STATE_DIR)).expanduser()
     return MonitorConfig(
         lana_bank_dir=Path(monitor.get("lana_bank_dir", DEFAULT_LANA_BANK_DIR)).expanduser(),
-        state_dir=Path(monitor.get("state_dir", DEFAULT_STATE_DIR)).expanduser(),
+        state_dir=state_dir,
         poll_interval_seconds=int(monitor.get("poll_interval_seconds", 300)),
         codex_timeout_seconds=int(monitor.get("codex_timeout_seconds", 600)),
         triage_new_incidents=bool(monitor.get("triage_new_incidents", True)),
+        auto_acknowledge=bool(monitor.get("auto_acknowledge", True)),
+        auto_resolve_false_positive=bool(monitor.get("auto_resolve_false_positive", False)),
+        auto_fix_bug_possible=bool(monitor.get("auto_fix_bug_possible", True)),
+        drua_shadow_enabled=bool(monitor.get("drua_shadow_enabled", True)),
+        auto_drua_debug_bug_possible=bool(monitor.get("auto_drua_debug_bug_possible", True)),
+        fix_root_dir=Path(monitor.get("fix_root_dir", state_dir / "fixes")).expanduser(),
+        triage_max_attempts=int(monitor.get("triage_max_attempts", 2)),
+        fix_max_attempts=int(monitor.get("fix_max_attempts", 3)),
         assignee_user_id=parse_assignee_user_ids(monitor.get("assignee_user_id")),
         assignee_aliases=parse_assignee_aliases(monitor.get("assignee_aliases")),
         zenduty_team_id=str(monitor.get("zenduty_team_id", "")).strip(),
@@ -219,9 +240,121 @@ class Store:
                 log_path text,
                 error text
             );
+
+            create table if not exists incident_jobs (
+                id integer primary key autoincrement,
+                incident_unique_id text not null,
+                kind text not null,
+                status text not null default 'pending',
+                attempts integer not null default 0,
+                max_attempts integer not null default 1,
+                created_at text not null,
+                updated_at text not null,
+                started_at text,
+                finished_at text,
+                log_path text,
+                error text,
+                result_json text,
+                workspace_path text,
+                branch_name text,
+                unique(incident_unique_id, kind)
+            );
             """
         )
+        self._ensure_column("incidents", "workflow_state", "text")
+        self._ensure_column("incidents", "classification", "text")
+        self._ensure_column("incidents", "zenduty_url", "text")
+        self._ensure_column("incidents", "acknowledged_at", "text")
+        self._ensure_column("incidents", "fix_workspace", "text")
+        self._ensure_column("incidents", "fix_branch", "text")
+        self._ensure_column("incidents", "fix_commits", "text")
+        self._ensure_column("incidents", "fix_summary", "text")
+        self._ensure_column("incidents", "fix_log_path", "text")
+        self._ensure_column("incidents", "drua_workflow_state", "text")
+        self._ensure_column("incidents", "drua_classification", "text")
+        self._ensure_column("incidents", "drua_triage_summary", "text")
+        self._ensure_column("incidents", "drua_triage_log_path", "text")
+        self._ensure_column("incidents", "drua_fix_summary", "text")
+        self._ensure_column("incidents", "drua_fix_log_path", "text")
+        self._ensure_column("incidents", "drua_fix_workspace", "text")
+        self._ensure_column("incidents", "drua_fix_branch", "text")
+        self._ensure_column("incidents", "drua_fix_commits", "text")
+        self.conn.execute(
+            """
+            update incidents
+            set zenduty_url = 'https://www.zenduty.com/incidents/' || incident_number || '/'
+            where zenduty_url is null and incident_number is not null
+            """
+        )
+        self._backfill_workflow_summaries()
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute(f"pragma table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self.conn.execute(f"alter table {table} add column {column} {ddl}")
+
+    def _backfill_workflow_summaries(self) -> None:
+        rows = self.conn.execute(
+            """
+            select incident_unique_id, kind, log_path, result_json
+            from incident_jobs
+            where kind in ('triage', 'fix', 'drua_triage', 'drua_fix')
+              and result_json is not null
+            order by finished_at
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"] or "{}")
+            except json.JSONDecodeError:
+                result = {}
+            summary = result.get("summary") if isinstance(result, dict) else None
+            if row["kind"] == "triage":
+                self.conn.execute(
+                    """
+                    update incidents
+                    set triage_summary = coalesce(?, triage_summary),
+                        triage_log_path = coalesce(?, triage_log_path)
+                    where unique_id = ?
+                    """,
+                    (summary, row["log_path"], row["incident_unique_id"]),
+                )
+            elif row["kind"] == "fix":
+                self.conn.execute(
+                    """
+                    update incidents
+                    set fix_summary = coalesce(?, fix_summary),
+                        fix_log_path = coalesce(?, fix_log_path)
+                    where unique_id = ?
+                    """,
+                    (summary, row["log_path"], row["incident_unique_id"]),
+                )
+            elif row["kind"] == "drua_triage":
+                classification = result.get("classification") if isinstance(result, dict) else None
+                self.conn.execute(
+                    """
+                    update incidents
+                    set drua_triage_summary = coalesce(?, drua_triage_summary),
+                        drua_triage_log_path = coalesce(?, drua_triage_log_path),
+                        drua_classification = coalesce(?, drua_classification)
+                    where unique_id = ?
+                    """,
+                    (summary, row["log_path"], classification, row["incident_unique_id"]),
+                )
+            elif row["kind"] == "drua_fix":
+                self.conn.execute(
+                    """
+                    update incidents
+                    set drua_fix_summary = coalesce(?, drua_fix_summary),
+                        drua_fix_log_path = coalesce(?, drua_fix_log_path)
+                    where unique_id = ?
+                    """,
+                    (summary, row["log_path"], row["incident_unique_id"]),
+                )
 
     def begin_run(self, kind: str, log_path: Path) -> int:
         cur = self.conn.execute(
@@ -243,6 +376,7 @@ class Store:
         now = utc_now()
         for incident in incidents:
             unique_id = incident["unique_id"]
+            zenduty_url = incident_zenduty_url(incident)
             existing = self.conn.execute(
                 "select unique_id from incidents where unique_id = ?", (unique_id,)
             ).fetchone()
@@ -252,8 +386,9 @@ class Store:
                     """
                     insert into incidents(
                         unique_id, incident_number, title, status, assigned_to,
-                        creation_date, urgency, first_seen_at, last_seen_at, raw_json
-                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        creation_date, urgency, first_seen_at, last_seen_at, raw_json,
+                        workflow_state, zenduty_url
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         unique_id,
@@ -266,6 +401,8 @@ class Store:
                         now,
                         now,
                         json.dumps(incident, sort_keys=True),
+                        "new",
+                        zenduty_url,
                     ),
                 )
             else:
@@ -273,7 +410,8 @@ class Store:
                     """
                     update incidents
                     set incident_number = ?, title = ?, status = ?, assigned_to = ?,
-                        creation_date = ?, urgency = ?, last_seen_at = ?, raw_json = ?
+                        creation_date = ?, urgency = ?, last_seen_at = ?, raw_json = ?,
+                        zenduty_url = coalesce(?, zenduty_url)
                     where unique_id = ?
                     """,
                     (
@@ -285,6 +423,7 @@ class Store:
                         incident.get("urgency"),
                         now,
                         json.dumps(incident, sort_keys=True),
+                        zenduty_url,
                         unique_id,
                     ),
                 )
@@ -295,12 +434,330 @@ class Store:
         self.conn.execute(
             """
             update incidents
-            set triage_status = ?, triage_summary = ?, triage_log_path = ?
+            set triage_status = ?, triage_summary = ?, triage_log_path = ?,
+                workflow_state = ?
             where unique_id = ?
             """,
-            (status, summary, str(log_path), unique_id),
+            (status, summary, str(log_path), status, unique_id),
         )
         self.conn.commit()
+
+    def enqueue_job(
+        self,
+        incident_unique_id: str,
+        kind: str,
+        max_attempts: int,
+        workspace_path: str | None = None,
+        branch_name: str | None = None,
+        reset: bool = False,
+    ) -> bool:
+        now = utc_now()
+        try:
+            self.conn.execute(
+                """
+                insert into incident_jobs(
+                    incident_unique_id, kind, status, attempts, max_attempts,
+                    created_at, updated_at, workspace_path, branch_name
+                ) values (?, ?, 'pending', 0, ?, ?, ?, ?, ?)
+                """,
+                (incident_unique_id, kind, max_attempts, now, now, workspace_path, branch_name),
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            if not reset:
+                return False
+            self.conn.execute(
+                """
+                update incident_jobs
+                set status = 'pending', attempts = 0, max_attempts = ?,
+                    updated_at = ?, started_at = null, finished_at = null,
+                    error = null, result_json = null,
+                    workspace_path = coalesce(?, workspace_path),
+                    branch_name = coalesce(?, branch_name)
+                where incident_unique_id = ? and kind = ?
+                """,
+                (
+                    max_attempts,
+                    now,
+                    workspace_path,
+                    branch_name,
+                    incident_unique_id,
+                    kind,
+                ),
+            )
+            self.conn.commit()
+            if str(kind).startswith("drua_"):
+                self.conn.execute(
+                    "update incidents set drua_workflow_state = ? where unique_id = ?",
+                    (f"{kind}_pending", incident_unique_id),
+                )
+            else:
+                self.conn.execute(
+                    "update incidents set workflow_state = ? where unique_id = ?",
+                    (f"{kind}_pending", incident_unique_id),
+                )
+            self.conn.commit()
+            return True
+
+    def incident_by_number(self, incident_number: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "select * from incidents where incident_number = ?", (incident_number,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def resolve_incident_ref(self, incident_ref: str) -> dict[str, Any] | None:
+        incident = self.incident(incident_ref)
+        if incident:
+            return incident
+        if incident_ref.isdigit():
+            return self.incident_by_number(int(incident_ref))
+        return None
+
+    def enqueue_triage_jobs(self, incidents: list[dict[str, Any]], max_attempts: int) -> int:
+        count = 0
+        for incident in incidents:
+            if incident.get("status") != "triggered":
+                continue
+            if self.enqueue_job(str(incident["unique_id"]), "triage", max_attempts):
+                self.conn.execute(
+                    "update incidents set workflow_state = ? where unique_id = ?",
+                    ("triage_pending", incident["unique_id"]),
+                )
+                count += 1
+        self.conn.commit()
+        return count
+
+    def enqueue_drua_triage_jobs(self, incidents: list[dict[str, Any]], max_attempts: int) -> int:
+        count = 0
+        for incident in incidents:
+            if incident.get("status") != "triggered":
+                continue
+            if self.enqueue_job(str(incident["unique_id"]), "drua_triage", max_attempts):
+                self.conn.execute(
+                    "update incidents set drua_workflow_state = ? where unique_id = ?",
+                    ("drua_triage_pending", incident["unique_id"]),
+                )
+                count += 1
+        self.conn.commit()
+        return count
+
+    def claim_job(self, kind: str) -> dict[str, Any] | None:
+        now = utc_now()
+        self.conn.execute("begin immediate")
+        row = self.conn.execute(
+            """
+            select *
+            from incident_jobs
+            where kind = ?
+              and status in ('pending', 'failed')
+              and attempts < max_attempts
+            order by created_at, id
+            limit 1
+            """,
+            (kind,),
+        ).fetchone()
+        if row is None:
+            self.conn.commit()
+            return None
+        self.conn.execute(
+            """
+            update incident_jobs
+            set status = 'running', attempts = attempts + 1,
+                started_at = ?, updated_at = ?, error = null
+            where id = ?
+            """,
+            (now, now, row["id"]),
+        )
+        if str(kind).startswith("drua_"):
+            self.conn.execute(
+                "update incidents set drua_workflow_state = ? where unique_id = ?",
+                (f"{kind}_running", row["incident_unique_id"]),
+            )
+        else:
+            self.conn.execute(
+                "update incidents set workflow_state = ? where unique_id = ?",
+                (f"{kind}_running", row["incident_unique_id"]),
+            )
+        self.conn.commit()
+        claimed = self.conn.execute("select * from incident_jobs where id = ?", (row["id"],)).fetchone()
+        return dict(claimed) if claimed else None
+
+    def finish_job(
+        self,
+        job_id: int,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        log_path: Path | None = None,
+        workspace_path: str | None = None,
+        branch_name: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            update incident_jobs
+            set status = ?, finished_at = ?, updated_at = ?, result_json = ?,
+                error = ?, log_path = coalesce(?, log_path),
+                workspace_path = coalesce(?, workspace_path),
+                branch_name = coalesce(?, branch_name)
+            where id = ?
+            """,
+            (
+                status,
+                utc_now(),
+                utc_now(),
+                json.dumps(result or {}, sort_keys=True),
+                error,
+                str(log_path) if log_path else None,
+                workspace_path,
+                branch_name,
+                job_id,
+            ),
+        )
+        self.conn.commit()
+
+    def update_incident_workflow(
+        self,
+        unique_id: str,
+        workflow_state: str,
+        classification: str | None = None,
+        summary: str | None = None,
+        log_path: Path | None = None,
+        acknowledged: bool = False,
+        fix_workspace: str | None = None,
+        fix_branch: str | None = None,
+        fix_commits: list[str] | None = None,
+        fix_update: bool = False,
+    ) -> None:
+        acknowledged_at = utc_now() if acknowledged else None
+        if fix_update:
+            self.conn.execute(
+                """
+                update incidents
+                set workflow_state = ?,
+                    classification = coalesce(?, classification),
+                    fix_summary = coalesce(?, fix_summary),
+                    fix_log_path = coalesce(?, fix_log_path),
+                    acknowledged_at = coalesce(?, acknowledged_at),
+                    fix_workspace = coalesce(?, fix_workspace),
+                    fix_branch = coalesce(?, fix_branch),
+                    fix_commits = coalesce(?, fix_commits)
+                where unique_id = ?
+                """,
+                (
+                    workflow_state,
+                    classification,
+                    summary,
+                    str(log_path) if log_path else None,
+                    acknowledged_at,
+                    fix_workspace,
+                    fix_branch,
+                    json.dumps(fix_commits or []) if fix_commits is not None else None,
+                    unique_id,
+                ),
+            )
+        else:
+            self.conn.execute(
+                """
+                update incidents
+                set workflow_state = ?,
+                    classification = coalesce(?, classification),
+                    triage_summary = coalesce(?, triage_summary),
+                    triage_log_path = coalesce(?, triage_log_path),
+                    acknowledged_at = coalesce(?, acknowledged_at),
+                    fix_workspace = coalesce(?, fix_workspace),
+                    fix_branch = coalesce(?, fix_branch),
+                    fix_commits = coalesce(?, fix_commits)
+                where unique_id = ?
+                """,
+                (
+                    workflow_state,
+                    classification,
+                    summary,
+                    str(log_path) if log_path else None,
+                    acknowledged_at,
+                    fix_workspace,
+                    fix_branch,
+                    json.dumps(fix_commits or []) if fix_commits is not None else None,
+                    unique_id,
+                ),
+            )
+        self.conn.commit()
+
+    def update_drua_workflow(
+        self,
+        unique_id: str,
+        workflow_state: str,
+        classification: str | None = None,
+        summary: str | None = None,
+        log_path: Path | None = None,
+        fix_workspace: str | None = None,
+        fix_branch: str | None = None,
+        fix_commits: list[str] | None = None,
+        fix_update: bool = False,
+    ) -> None:
+        if fix_update:
+            self.conn.execute(
+                """
+                update incidents
+                set drua_workflow_state = ?,
+                    drua_classification = coalesce(?, drua_classification),
+                    drua_fix_summary = coalesce(?, drua_fix_summary),
+                    drua_fix_log_path = coalesce(?, drua_fix_log_path),
+                    drua_fix_workspace = coalesce(?, drua_fix_workspace),
+                    drua_fix_branch = coalesce(?, drua_fix_branch),
+                    drua_fix_commits = coalesce(?, drua_fix_commits)
+                where unique_id = ?
+                """,
+                (
+                    workflow_state,
+                    classification,
+                    summary,
+                    str(log_path) if log_path else None,
+                    fix_workspace,
+                    fix_branch,
+                    json.dumps(fix_commits or []) if fix_commits is not None else None,
+                    unique_id,
+                ),
+            )
+        else:
+            self.conn.execute(
+                """
+                update incidents
+                set drua_workflow_state = ?,
+                    drua_classification = coalesce(?, drua_classification),
+                    drua_triage_summary = coalesce(?, drua_triage_summary),
+                    drua_triage_log_path = coalesce(?, drua_triage_log_path)
+                where unique_id = ?
+                """,
+                (
+                    workflow_state,
+                    classification,
+                    summary,
+                    str(log_path) if log_path else None,
+                    unique_id,
+                ),
+            )
+        self.conn.commit()
+
+    def jobs_for_incidents(self, unique_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self.conn.execute(
+            f"""
+            select *
+            from incident_jobs
+            where incident_unique_id in ({placeholders})
+            order by created_at
+            """,
+            tuple(unique_ids),
+        ).fetchall()
+        jobs: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            job = dict(row)
+            jobs.setdefault(str(job["incident_unique_id"]), []).append(job)
+        return jobs
 
     def incident(self, unique_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -329,6 +786,24 @@ class Store:
                 "triage_status",
                 "triage_summary",
                 "triage_log_path",
+                "workflow_state",
+                "classification",
+                "zenduty_url",
+                "acknowledged_at",
+                "fix_workspace",
+                "fix_branch",
+                "fix_commits",
+                "fix_summary",
+                "fix_log_path",
+                "drua_workflow_state",
+                "drua_classification",
+                "drua_triage_summary",
+                "drua_triage_log_path",
+                "drua_fix_summary",
+                "drua_fix_log_path",
+                "drua_fix_workspace",
+                "drua_fix_branch",
+                "drua_fix_commits",
             ]:
                 if stored.get(key) is not None:
                     merged[key] = stored[key]
@@ -347,6 +822,35 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def tracked_incidents(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            select *
+            from incidents
+            where workflow_state is not null
+              and workflow_state not in ('new')
+            order by last_seen_at desc
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+        tracked: list[dict[str, Any]] = []
+        for row in rows:
+            incident = dict(row)
+            try:
+                raw = json.loads(incident.get("raw_json") or "{}")
+                if isinstance(raw, dict):
+                    raw.update(incident)
+                    incident = raw
+            except json.JSONDecodeError:
+                pass
+            tracked.append(incident)
+        jobs = self.jobs_for_incidents([str(i["unique_id"]) for i in tracked if i.get("unique_id")])
+        return [
+            {**incident, "jobs": jobs.get(str(incident.get("unique_id")), [])}
+            for incident in tracked
+        ]
+
 
 def codex_command(config: MonitorConfig, prompt: str) -> list[str]:
     cmd = [config.codex.command, "exec"]
@@ -359,12 +863,17 @@ def codex_command(config: MonitorConfig, prompt: str) -> list[str]:
     return cmd
 
 
-def run_codex(config: MonitorConfig, prompt: str, log_path: Path) -> subprocess.CompletedProcess[str]:
+def run_codex(
+    config: MonitorConfig,
+    prompt: str,
+    log_path: Path,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
     proc = subprocess.run(
         codex_command(config, prompt),
-        cwd=config.lana_bank_dir,
+        cwd=cwd or config.lana_bank_dir,
         text=True,
         capture_output=True,
         timeout=config.codex_timeout_seconds,
@@ -474,6 +983,16 @@ def add_assignee_aliases(config: MonitorConfig, incidents: list[dict[str, Any]])
             copied["assignee_alias"] = aliases.get(str(assigned_to))
         enriched.append(copied)
     return enriched
+
+
+def incident_zenduty_url(incident: dict[str, Any]) -> str | None:
+    incident_number = incident.get("incident_number")
+    if incident_number:
+        return f"https://www.zenduty.com/incidents/{incident_number}/"
+    unique_id = incident.get("unique_id")
+    if unique_id:
+        return f"https://www.zenduty.com/incidents/{unique_id}/"
+    return None
 
 
 def check_counts(checks: list[dict[str, Any]]) -> dict[str, int]:
@@ -732,7 +1251,13 @@ def poll_prompt(config: MonitorConfig) -> str:
     ).strip()
 
 
-def triage_prompt(incident: dict[str, Any]) -> str:
+def triage_prompt(incident: dict[str, Any], auto_acknowledge: bool = True) -> str:
+    acknowledgement_instruction = (
+        "Acknowledge the Zenduty incident after the tagged note is written."
+        if auto_acknowledge
+        else "Do not acknowledge the Zenduty incident automatically."
+    )
+    acknowledged_json_value = "true" if auto_acknowledge else "false"
     return textwrap.dedent(
         f"""
         Use the lana-alert-fixer workflow.
@@ -749,23 +1274,172 @@ def triage_prompt(incident: dict[str, Any]) -> str:
         - honeycomb_query_results: {incident.get("honeycomb_query_results")}
 
         Fetch the incident details, inspect linked Honeycomb context, identify the code path,
-        classify as false positive or real problem, and add a Zenduty note with the final summary.
+        classify as false_positive, bug_possible, or needs_human, and add a Zenduty note with the
+        exact tag "[lana-monitor:triage]" in the first line.
         If this is a HoneyComb incident and honeycomb_urls is present, call honeycomb_get_query_results
         with the first URL before forming the final diagnosis.
 
-        Do not resolve the incident.
+        {acknowledgement_instruction}
+        Do not resolve the incident; false positives require user review before resolution.
         Do not push.
-        Do not change code unless the issue is clearly a false-positive severity fix or a real bug
-        with a low-risk local fix. If you change code, commit locally with a conventional commit.
+        Do not change code during triage. If the incident looks like a real bug, classify it
+        as bug_possible so the fix worker can handle reproduction and code changes.
 
         End your response with a compact JSON object on its own line:
         {{
           "incident_number": {incident.get("incident_number") or "null"},
           "unique_id": "{incident["unique_id"]}",
-          "classification": "false_positive|real_problem|needs_human",
+          "classification": "false_positive|bug_possible|needs_human",
+          "acknowledged": {acknowledged_json_value},
+          "note_written": true,
+          "note_id": null,
           "changed_code": false,
           "committed": false,
           "summary": "one paragraph"
+        }}
+        """
+    ).strip()
+
+
+def fix_prompt(
+    incident: dict[str, Any],
+    workspace: Path,
+    branch_name: str,
+    source_repo: Path,
+) -> str:
+    return textwrap.dedent(
+        f"""
+        Work on the bug indicated by this Zenduty incident.
+
+        Incident:
+        - unique_id: {incident["unique_id"]}
+        - incident_number: {incident.get("incident_number")}
+        - title: {incident.get("title")}
+        - summary: {incident.get("summary")}
+        - triage_summary: {incident.get("triage_summary")}
+        - zenduty_url: {incident.get("zenduty_url")}
+
+        Workspace:
+        - local folder: {workspace}
+        - branch: {branch_name}
+        - source repo: {source_repo}
+
+        Requirements:
+        - Use the existing repository in the workspace folder.
+        - Keep all code changes on branch {branch_name}.
+        - Reproduce the suspected bug or document why reproduction is not possible.
+        - Implement a fix only if there is credible bug evidence.
+        - Run focused tests or commands that provide evidence.
+        - Commit any code changes locally on {branch_name}; do not push.
+        - Add a Zenduty note with the exact tag "[lana-monitor:fix]" in the first line.
+        - Do not resolve the Zenduty incident.
+
+        End your response with a compact JSON object on its own line:
+        {{
+          "incident_number": {incident.get("incident_number") or "null"},
+          "unique_id": "{incident["unique_id"]}",
+          "status": "fixed|not_reproduced|needs_human|failed",
+          "workspace": "{workspace}",
+          "branch": "{branch_name}",
+          "commits": [],
+          "reproduction_evidence": "commands/output summary",
+          "fix_evidence": "commands/output summary",
+          "note_written": true,
+          "summary": "one paragraph"
+        }}
+        """
+    ).strip()
+
+
+def drua_triage_prompt(incident: dict[str, Any]) -> str:
+    return textwrap.dedent(
+        f"""
+        Use Drua MCP tools to independently evaluate this Zenduty incident as a shadow run.
+
+        Incident:
+        - unique_id: {incident["unique_id"]}
+        - incident_number: {incident.get("incident_number")}
+        - status: {incident.get("status")}
+        - title: {incident.get("title")}
+        - creation_date: {incident.get("creation_date")}
+        - assigned_to: {incident.get("assigned_to")}
+        - summary: {incident.get("summary")}
+        - honeycomb_urls: {incident.get("honeycomb_urls")}
+        - honeycomb_query_results: {incident.get("honeycomb_query_results")}
+
+        Requirements:
+        - You may call read-only Drua tools, including Zenduty get/list calls, Honeycomb, Concourse,
+          Kubernetes, GitHub, and related debugging tools if available.
+        - Do not add Zenduty notes.
+        - Do not acknowledge, resolve, or otherwise update Zenduty incident status.
+        - Do not change code and do not commit.
+        - Classify as false_positive, bug_possible, or needs_human.
+        - Record what status or note you would have written, but do not perform those actions.
+        - If this appears to need real debugging/fixing, classify bug_possible.
+
+        Return only valid JSON, with no markdown and no prose:
+        {{
+          "incident_number": {incident.get("incident_number") or "null"},
+          "unique_id": "{incident["unique_id"]}",
+          "classification": "false_positive|bug_possible|needs_human",
+          "would_acknowledge": true,
+          "would_resolve": false,
+          "would_note": "summary of the Zenduty note you would have written",
+          "evidence": "read-only evidence gathered through Drua tools",
+          "summary": "one paragraph comparison-ready decision"
+        }}
+        """
+    ).strip()
+
+
+def drua_fix_prompt(
+    incident: dict[str, Any],
+    workspace: Path,
+    branch_name: str,
+    source_repo: Path,
+) -> str:
+    return textwrap.dedent(
+        f"""
+        Run a shadow debug/fix attempt for this Zenduty incident. This is a local comparison run.
+
+        Incident:
+        - unique_id: {incident["unique_id"]}
+        - incident_number: {incident.get("incident_number")}
+        - title: {incident.get("title")}
+        - summary: {incident.get("summary")}
+        - drua_triage_summary: {incident.get("drua_triage_summary")}
+        - zenduty_url: {incident.get("zenduty_url")}
+
+        Workspace:
+        - local folder: {workspace}
+        - branch: {branch_name}
+        - source repo: {source_repo}
+
+        Requirements:
+        - Use read-only Drua MCP tools for incident, observability, CI, and deployment evidence.
+        - Do not add Zenduty notes.
+        - Do not acknowledge, resolve, or otherwise update Zenduty incident status.
+        - Use the existing repository in the workspace folder.
+        - Keep all code changes on branch {branch_name}.
+        - Reproduce the suspected bug or document why reproduction is not possible.
+        - Implement a fix only if there is credible bug evidence.
+        - Run focused tests or commands that provide before/after evidence.
+        - Commit local code changes on {branch_name}; do not push.
+        - Record what status changes and notes you would have made, but do not perform them.
+
+        Return only valid JSON, with no markdown and no prose:
+        {{
+          "incident_number": {incident.get("incident_number") or "null"},
+          "unique_id": "{incident["unique_id"]}",
+          "status": "fixed|not_reproduced|needs_human|failed",
+          "workspace": "{workspace}",
+          "branch": "{branch_name}",
+          "commits": [],
+          "reproduction_evidence": "commands/tool evidence before the change",
+          "fix_evidence": "commands/tool evidence after the change",
+          "would_note": "summary of the Zenduty note you would have written",
+          "would_status_change": null,
+          "summary": "one paragraph comparison-ready result"
         }}
         """
     ).strip()
@@ -915,12 +1589,33 @@ def write_status(
     dependabot_prs = dependabot_prs or []
     concourse_failures = concourse_failures or []
     schedule = normalize_schedule(schedule, config)
+    if store is not None and incidents:
+        jobs = store.jobs_for_incidents([str(incident["unique_id"]) for incident in incidents])
+        incidents = [
+            {**incident, "jobs": jobs.get(str(incident["unique_id"]), [])}
+            for incident in incidents
+        ]
     if schedule_blocks_reporting(schedule) and incidents:
         schedule["suppressed_incident_count"] = len(incidents)
         incidents = []
     triggered = [i for i in incidents if i.get("status") == "triggered"]
     acknowledged = [i for i in incidents if i.get("status") == "acknowledged"]
     ready_dependabot_prs = [pr for pr in dependabot_prs if pr.get("ready_to_merge")]
+    tracked_incidents = store.tracked_incidents() if store is not None else []
+    workflow_sources: dict[str, dict[str, Any]] = {}
+    for incident in tracked_incidents + incidents:
+        unique_id = incident.get("unique_id")
+        if unique_id:
+            workflow_sources[str(unique_id)] = incident
+    workflow_counts: dict[str, int] = {}
+    drua_workflow_counts: dict[str, int] = {}
+    for incident in workflow_sources.values():
+        state = str(incident.get("workflow_state") or "unknown")
+        workflow_counts[state] = workflow_counts.get(state, 0) + 1
+        drua_state = incident.get("drua_workflow_state")
+        if drua_state:
+            drua_state = str(drua_state)
+            drua_workflow_counts[drua_state] = drua_workflow_counts.get(drua_state, 0) + 1
     concourse_snooze = read_concourse_snooze(config)
     active_concourse_failures = concourse_failures if not concourse_snooze["active"] else []
     color = (
@@ -934,7 +1629,6 @@ def write_status(
     )
     if error or zenduty_error:
         color = "gray"
-
     status = {
         "updated_at": utc_now(),
         "color": color,
@@ -951,7 +1645,24 @@ def write_status(
             "concourse_failed": len(concourse_failures),
             "concourse_unsnoozed_failed": len(active_concourse_failures),
             "schedule_suppressed": int(schedule.get("suppressed_incident_count") or 0),
+            "triage_pending": workflow_counts.get("triage_pending", 0),
+            "triage_running": workflow_counts.get("triage_running", 0),
+            "bug_possible": workflow_counts.get("bug_possible", 0),
+            "fix_running": workflow_counts.get("fix_running", 0),
+            "fix_succeeded": workflow_counts.get("fix_succeeded", 0),
+            "needs_human": workflow_counts.get("needs_human", 0),
+            "review_required": workflow_counts.get("review_required", 0),
+            "drua_triage_pending": drua_workflow_counts.get("drua_triage_pending", 0),
+            "drua_triage_running": drua_workflow_counts.get("drua_triage_running", 0),
+            "drua_bug_possible": drua_workflow_counts.get("drua_bug_possible", 0),
+            "drua_fix_pending": drua_workflow_counts.get("drua_fix_pending", 0),
+            "drua_fix_running": drua_workflow_counts.get("drua_fix_running", 0),
+            "drua_fix_succeeded": drua_workflow_counts.get("drua_fix_succeeded", 0),
+            "drua_needs_human": drua_workflow_counts.get("drua_needs_human", 0),
+            "drua_review_required": drua_workflow_counts.get("drua_review_required", 0),
         },
+        "workflow_counts": workflow_counts,
+        "drua_workflow_counts": drua_workflow_counts,
         "schedule": schedule,
         "dependabot": {
             "repo": config.dependabot_repo,
@@ -973,6 +1684,7 @@ def write_status(
         "details_html": str(config.state_dir / "details.html"),
         "logs_dir": str(config.state_dir / "logs"),
         "incidents": incidents,
+        "tracked_incidents": tracked_incidents,
     }
     config.state_dir.mkdir(parents=True, exist_ok=True)
     (config.state_dir / "status.json").write_text(json.dumps(status, indent=2, sort_keys=True))
@@ -1030,6 +1742,7 @@ def write_details_html(
     concourse_snooze = concourse.get("snooze", {}) if isinstance(concourse, dict) else {}
     schedule = normalize_schedule(status.get("schedule"), config)
     runs = store.recent_runs() if store is not None else []
+    tracked = status.get("tracked_incidents", [])
     rows = []
     for incident in incidents:
         assigned_to = incident.get("assigned_to")
@@ -1057,6 +1770,24 @@ def write_details_html(
             if log_path
             else '<span class="muted">no triage log</span>'
         )
+        fix_log_path = incident.get("fix_log_path")
+        fix_log_link = (
+            f'<a href="file://{e(fix_log_path)}">fix log</a>'
+            if fix_log_path
+            else '<span class="muted">no fix log</span>'
+        )
+        drua_triage_log_path = incident.get("drua_triage_log_path")
+        drua_triage_log_link = (
+            f'<a href="file://{e(drua_triage_log_path)}">Drua triage log</a>'
+            if drua_triage_log_path
+            else '<span class="muted">no Drua triage log</span>'
+        )
+        drua_fix_log_path = incident.get("drua_fix_log_path")
+        drua_fix_log_link = (
+            f'<a href="file://{e(drua_fix_log_path)}">Drua fix log</a>'
+            if drua_fix_log_path
+            else '<span class="muted">no Drua fix log</span>'
+        )
         rows.append(
             f"""
             <article class="incident {e(incident.get('status'))}">
@@ -1073,10 +1804,30 @@ def write_details_html(
                 <div><dt>Created</dt><dd>{time_span(incident.get('creation_date')) or e(incident.get('creation_date'))}</dd></div>
                 <div><dt>First Seen</dt><dd>{time_span(incident.get('first_seen_at')) or e(incident.get('first_seen_at'))}</dd></div>
                 <div><dt>Triage</dt><dd>{e(incident.get('triage_status', 'pending'))} · {log_link}</dd></div>
+                <div><dt>Workflow</dt><dd>{e(incident.get('workflow_state') or 'pending')}</dd></div>
+                <div><dt>Classification</dt><dd>{e(incident.get('classification') or '')}</dd></div>
+                <div><dt>Zenduty</dt><dd>{f'<a href="{e(incident.get("zenduty_url"))}">incident</a>' if incident.get("zenduty_url") else ''}</dd></div>
+                <div><dt>Fix Workspace</dt><dd><code>{e(incident.get('fix_workspace') or '')}</code></dd></div>
+                <div><dt>Fix Branch</dt><dd><code>{e(incident.get('fix_branch') or '')}</code></dd></div>
+                <div><dt>Fix</dt><dd>{fix_log_link}</dd></div>
+                <div><dt>Drua Shadow</dt><dd>{e(incident.get('drua_workflow_state') or 'pending')} · {drua_triage_log_link}</dd></div>
+                <div><dt>Drua Classification</dt><dd>{e(incident.get('drua_classification') or '')}</dd></div>
+                <div><dt>Drua Fix Workspace</dt><dd><code>{e(incident.get('drua_fix_workspace') or '')}</code></dd></div>
+                <div><dt>Drua Fix Branch</dt><dd><code>{e(incident.get('drua_fix_branch') or '')}</code></dd></div>
+                <div><dt>Drua Fix</dt><dd>{drua_fix_log_link}</dd></div>
               </dl>
               <section>
                 <h3>Triage Summary</h3>
                 <p>{e(incident.get('triage_summary') or 'No triage summary recorded yet.')}</p>
+              </section>
+              <section>
+                <h3>Fix Summary</h3>
+                <p>{e(incident.get('fix_summary') or 'No fix summary recorded yet.')}</p>
+              </section>
+              <section>
+                <h3>Drua Shadow Summary</h3>
+                <p>{e(incident.get('drua_triage_summary') or 'No Drua triage summary recorded yet.')}</p>
+                <p>{e(incident.get('drua_fix_summary') or 'No Drua fix summary recorded yet.')}</p>
               </section>
               {honeycomb_details}
             </article>
@@ -1170,6 +1921,31 @@ def write_details_html(
     elif schedule.get("window_start"):
         schedule_window = f' · From {time_span(schedule.get("window_start"))}'
     body = "\n".join(rows) or f'<p class="empty">No filtered open incidents.{e(schedule_note)}</p>'
+    tracked_rows = []
+    for incident in tracked[:20]:
+        url = incident.get("zenduty_url")
+        title = f'#{incident.get("incident_number", "?")}'
+        title_html = f'<a href="{e(url)}">{e(title)}</a>' if url else e(title)
+        workspace = incident.get("fix_workspace")
+        workspace_link = f'<a href="file://{e(workspace)}">{e(workspace)}</a>' if workspace else ""
+        drua_workspace = incident.get("drua_fix_workspace")
+        drua_workspace_link = f'<a href="file://{e(drua_workspace)}">{e(drua_workspace)}</a>' if drua_workspace else ""
+        tracked_rows.append(
+            f"""
+            <tr>
+              <td>{title_html}</td>
+              <td>{e(incident.get('workflow_state'))}</td>
+              <td>{e(incident.get('classification'))}</td>
+              <td>{workspace_link}</td>
+              <td><code>{e(incident.get('fix_branch') or '')}</code></td>
+              <td>{e(incident.get('drua_workflow_state'))}</td>
+              <td>{e(incident.get('drua_classification'))}</td>
+              <td>{drua_workspace_link}</td>
+              <td><code>{e(incident.get('drua_fix_branch') or '')}</code></td>
+            </tr>
+            """
+        )
+    tracked_body = "\n".join(tracked_rows) or '<tr><td colspan="9">No workflow history.</td></tr>'
     prs_body = "\n".join(pr_rows) or '<p class="empty">No open Dependabot PRs.</p>'
     concourse_body = "\n".join(concourse_rows) or '<p class="empty">No failed Concourse jobs.</p>'
     concourse_snooze_note = (
@@ -1351,6 +2127,15 @@ def write_details_html(
     </section>
     <section>{body}</section>
     <section>
+      <h2>Incident Workflow</h2>
+      <div class="runs">
+        <table>
+          <thead><tr><th>Incident</th><th>State</th><th>Classification</th><th>Fix Folder</th><th>Branch</th><th>Drua State</th><th>Drua Classification</th><th>Drua Fix Folder</th><th>Drua Branch</th></tr></thead>
+          <tbody>{tracked_body}</tbody>
+        </table>
+      </div>
+    </section>
+    <section>
       <h2>Concourse Failures</h2>
       <p class="muted">Failed, errored, or aborted jobs from {e(config.concourse_url)}.</p>
       {concourse_snooze_note}
@@ -1448,6 +2233,16 @@ def do_poll(config: MonitorConfig) -> int:
         )
         dependabot_prs, dependabot_error = fetch_dependabot_prs(config)
         new_incidents = store.upsert_incidents(incidents)
+        enqueued_triage = (
+            store.enqueue_triage_jobs(incidents, config.triage_max_attempts)
+            if config.triage_new_incidents and zenduty_error is None
+            else 0
+        )
+        enqueued_drua_triage = (
+            store.enqueue_drua_triage_jobs(incidents, config.triage_max_attempts)
+            if config.triage_new_incidents and config.drua_shadow_enabled and zenduty_error is None
+            else 0
+        )
         incidents = store.enrich_incidents(incidents)
         write_status(
             config,
@@ -1476,13 +2271,12 @@ def do_poll(config: MonitorConfig) -> int:
                     "concourse_error": concourse_error,
                     "schedule": schedule,
                     "zenduty_error": zenduty_error,
+                    "triage_enqueued": enqueued_triage,
+                    "drua_triage_enqueued": enqueued_drua_triage,
                 },
                 indent=2,
             )
         )
-        if config.triage_new_incidents and zenduty_error is None:
-            for incident in new_incidents:
-                do_triage(config, incident["unique_id"], store=store)
         return 1 if zenduty_error else 0
     except Exception as exc:
         write_status(config, [], error=str(exc), store=store)
@@ -1518,17 +2312,29 @@ def do_triage(config: MonitorConfig, incident_id: str, store: Store | None = Non
     log_path = config.state_dir / "logs" / f"incident-{incident_id}-triage.md"
     run_id = store.begin_run("triage", log_path)
     try:
-        proc = run_codex(config, triage_prompt(incident), log_path)
+        proc = run_codex(config, triage_prompt(incident, config.auto_acknowledge), log_path)
         if proc.returncode != 0:
             raise RuntimeError(f"codex exited with {proc.returncode}")
         summary = proc.stdout.strip()
+        classification = None
+        acknowledged = False
         try:
             payload = extract_json(proc.stdout)
             if isinstance(payload, dict) and payload.get("summary"):
                 summary = str(payload["summary"])
+                classification = str(payload.get("classification") or "").strip() or None
+                acknowledged = bool(payload.get("acknowledged"))
         except Exception:
             pass
-        store.mark_triaged(incident_id, "done", summary, log_path)
+        workflow_state = workflow_state_for_classification(classification)
+        store.update_incident_workflow(
+            incident_id,
+            workflow_state,
+            classification=classification,
+            summary=summary,
+            log_path=log_path,
+            acknowledged=acknowledged,
+        )
         store.finish_run(run_id, True)
         refresh_status_from_disk(config, store)
         print(summary)
@@ -1542,6 +2348,504 @@ def do_triage(config: MonitorConfig, incident_id: str, store: Store | None = Non
     finally:
         if owns_store:
             store.close()
+
+
+def workflow_state_for_classification(classification: str | None) -> str:
+    normalized = (classification or "").strip()
+    if normalized in BUG_CLASSIFICATIONS:
+        return "bug_possible"
+    if normalized in FALSE_POSITIVE_CLASSIFICATIONS:
+        return "review_required"
+    if normalized == "needs_human":
+        return "needs_human"
+    return "triage_done"
+
+
+def branch_slug(value: str, max_len: int = 52) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
+    return (slug or "incident")[:max_len].strip("-")
+
+
+def fix_workspace_for(config: MonitorConfig, incident: dict[str, Any]) -> tuple[Path, str]:
+    number = incident.get("incident_number") or "unknown"
+    unique_id = str(incident.get("unique_id") or "unknown")
+    title = branch_slug(str(incident.get("title") or unique_id), 32)
+    folder = config.fix_root_dir / f"incident-{number}-{unique_id}"
+    branch_name = f"zenduty/{number}-{title}"
+    return folder, branch_name
+
+
+def drua_fix_workspace_for(config: MonitorConfig, incident: dict[str, Any]) -> tuple[Path, str]:
+    number = incident.get("incident_number") or "unknown"
+    unique_id = str(incident.get("unique_id") or "unknown")
+    title = branch_slug(str(incident.get("title") or unique_id), 32)
+    folder = config.fix_root_dir / "drua-shadow" / f"incident-{number}-{unique_id}"
+    branch_name = f"drua-shadow/{number}-{title}"
+    return folder, branch_name
+
+
+def prepare_fix_workspace(config: MonitorConfig, workspace: Path, branch_name: str) -> None:
+    if (workspace / ".git").exists():
+        return
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    source = config.lana_bank_dir
+    subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "--is-inside-work-tree"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    if workspace.exists() and any(workspace.iterdir()):
+        raise RuntimeError(f"fix workspace exists but is not a git worktree: {workspace}")
+    subprocess.run(
+        ["git", "-C", str(source), "worktree", "add", "-B", branch_name, str(workspace)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+def do_work_triage(config: MonitorConfig, once: bool = True, limit: int | None = None) -> int:
+    processed = 0
+    store = Store(config.state_dir)
+    try:
+        while limit is None or processed < limit:
+            job = store.claim_job("triage")
+            if job is None:
+                if once:
+                    break
+                time.sleep(30)
+                continue
+            incident_id = str(job["incident_unique_id"])
+            incident = store.incident(incident_id)
+            if not incident:
+                store.finish_job(int(job["id"]), "failed", error=f"missing incident {incident_id}")
+                continue
+            log_path = config.state_dir / "logs" / f"incident-{incident_id}-triage-{job['attempts']}.md"
+            run_id = store.begin_run("triage-worker", log_path)
+            try:
+                proc = run_codex(config, triage_prompt(incident, config.auto_acknowledge), log_path)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"codex exited with {proc.returncode}")
+                payload = extract_json(proc.stdout)
+                if not isinstance(payload, dict):
+                    raise ValueError("Expected JSON object from triage Codex run")
+                summary = str(payload.get("summary") or proc.stdout.strip())
+                classification = str(payload.get("classification") or "needs_human").strip()
+                acknowledged = bool(payload.get("acknowledged"))
+                workflow_state = workflow_state_for_classification(classification)
+                store.update_incident_workflow(
+                    incident_id,
+                    workflow_state,
+                    classification=classification,
+                    summary=summary,
+                    log_path=log_path,
+                    acknowledged=acknowledged,
+                )
+                store.finish_job(int(job["id"]), "done", result=payload, log_path=log_path)
+                store.finish_run(run_id, True)
+                if config.auto_fix_bug_possible and classification in BUG_CLASSIFICATIONS:
+                    workspace, branch = fix_workspace_for(config, incident)
+                    store.enqueue_job(
+                        incident_id,
+                        "fix",
+                        config.fix_max_attempts,
+                        workspace_path=str(workspace),
+                        branch_name=branch,
+                    )
+                refresh_status_from_disk(config, store)
+                processed += 1
+            except Exception as exc:
+                store.finish_job(int(job["id"]), "failed", error=str(exc), log_path=log_path)
+                store.update_incident_workflow(incident_id, "triage_failed", summary=str(exc), log_path=log_path)
+                store.finish_run(run_id, False, str(exc))
+                refresh_status_from_disk(config, store)
+                print(f"triage worker failed for {incident_id}: {exc}", file=sys.stderr)
+                return 1
+            if once:
+                break
+        print(json.dumps({"triage_processed": processed}, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def do_work_fixes(config: MonitorConfig, once: bool = True, limit: int | None = None) -> int:
+    processed = 0
+    store = Store(config.state_dir)
+    try:
+        while limit is None or processed < limit:
+            job = store.claim_job("fix")
+            if job is None:
+                if once:
+                    break
+                time.sleep(30)
+                continue
+            incident_id = str(job["incident_unique_id"])
+            incident = store.incident(incident_id)
+            if not incident:
+                store.finish_job(int(job["id"]), "failed", error=f"missing incident {incident_id}")
+                continue
+            workspace = Path(job.get("workspace_path") or fix_workspace_for(config, incident)[0])
+            branch_name = str(job.get("branch_name") or fix_workspace_for(config, incident)[1])
+            log_path = config.state_dir / "logs" / f"incident-{incident_id}-fix-{job['attempts']}.md"
+            run_id = store.begin_run("fix-worker", log_path)
+            try:
+                prepare_fix_workspace(config, workspace, branch_name)
+                proc = run_codex(
+                    config,
+                    fix_prompt(incident, workspace, branch_name, config.lana_bank_dir),
+                    log_path,
+                    cwd=workspace,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"codex exited with {proc.returncode}")
+                payload = extract_json(proc.stdout)
+                if not isinstance(payload, dict):
+                    raise ValueError("Expected JSON object from fix Codex run")
+                status = str(payload.get("status") or "needs_human")
+                commits = payload.get("commits") if isinstance(payload.get("commits"), list) else []
+                workflow_state = "fix_succeeded" if status == "fixed" else f"fix_{status}"
+                store.update_incident_workflow(
+                    incident_id,
+                    workflow_state,
+                    summary=str(payload.get("summary") or ""),
+                    log_path=log_path,
+                    fix_workspace=str(workspace),
+                    fix_branch=branch_name,
+                    fix_commits=[str(commit) for commit in commits],
+                    fix_update=True,
+                )
+                store.finish_job(
+                    int(job["id"]),
+                    "done" if status == "fixed" else "review_required",
+                    result=payload,
+                    log_path=log_path,
+                    workspace_path=str(workspace),
+                    branch_name=branch_name,
+                )
+                store.finish_run(run_id, True)
+                refresh_status_from_disk(config, store)
+                processed += 1
+            except Exception as exc:
+                store.finish_job(int(job["id"]), "failed", error=str(exc), log_path=log_path)
+                store.update_incident_workflow(
+                    incident_id,
+                    "fix_failed",
+                    summary=str(exc),
+                    log_path=log_path,
+                    fix_workspace=str(workspace),
+                    fix_branch=branch_name,
+                    fix_update=True,
+                )
+                store.finish_run(run_id, False, str(exc))
+                refresh_status_from_disk(config, store)
+                print(f"fix worker failed for {incident_id}: {exc}", file=sys.stderr)
+                return 1
+            if once:
+                break
+        print(json.dumps({"fix_processed": processed}, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def do_work_drua_triage(config: MonitorConfig, once: bool = True, limit: int | None = None) -> int:
+    processed = 0
+    store = Store(config.state_dir)
+    try:
+        while limit is None or processed < limit:
+            job = store.claim_job("drua_triage")
+            if job is None:
+                if once:
+                    break
+                time.sleep(30)
+                continue
+            incident_id = str(job["incident_unique_id"])
+            incident = store.incident(incident_id)
+            if not incident:
+                store.finish_job(int(job["id"]), "failed", error=f"missing incident {incident_id}")
+                continue
+            log_path = config.state_dir / "logs" / f"incident-{incident_id}-drua-triage-{job['attempts']}.md"
+            run_id = store.begin_run("drua-triage-worker", log_path)
+            try:
+                proc = run_codex(config, drua_triage_prompt(incident), log_path)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"codex exited with {proc.returncode}")
+                payload = extract_json(proc.stdout)
+                if not isinstance(payload, dict):
+                    raise ValueError("Expected JSON object from Drua triage Codex run")
+                summary = str(payload.get("summary") or proc.stdout.strip())
+                classification = str(payload.get("classification") or "needs_human").strip()
+                workflow_state = "drua_" + workflow_state_for_classification(classification)
+                store.update_drua_workflow(
+                    incident_id,
+                    workflow_state,
+                    classification=classification,
+                    summary=summary,
+                    log_path=log_path,
+                )
+                store.finish_job(int(job["id"]), "done", result=payload, log_path=log_path)
+                store.finish_run(run_id, True)
+                if config.auto_drua_debug_bug_possible and classification in BUG_CLASSIFICATIONS:
+                    workspace, branch = drua_fix_workspace_for(config, incident)
+                    queued = store.enqueue_job(
+                        incident_id,
+                        "drua_fix",
+                        config.fix_max_attempts,
+                        workspace_path=str(workspace),
+                        branch_name=branch,
+                    )
+                    if queued:
+                        store.update_drua_workflow(
+                            incident_id,
+                            "drua_fix_pending",
+                            fix_workspace=str(workspace),
+                            fix_branch=branch,
+                            fix_update=True,
+                        )
+                refresh_status_from_disk(config, store)
+                processed += 1
+            except Exception as exc:
+                store.finish_job(int(job["id"]), "failed", error=str(exc), log_path=log_path)
+                store.update_drua_workflow(
+                    incident_id,
+                    "drua_triage_failed",
+                    summary=str(exc),
+                    log_path=log_path,
+                )
+                store.finish_run(run_id, False, str(exc))
+                refresh_status_from_disk(config, store)
+                print(f"Drua triage worker failed for {incident_id}: {exc}", file=sys.stderr)
+                return 1
+            if once:
+                break
+        print(json.dumps({"drua_triage_processed": processed}, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def do_work_drua_fixes(config: MonitorConfig, once: bool = True, limit: int | None = None) -> int:
+    processed = 0
+    store = Store(config.state_dir)
+    try:
+        while limit is None or processed < limit:
+            job = store.claim_job("drua_fix")
+            if job is None:
+                if once:
+                    break
+                time.sleep(30)
+                continue
+            incident_id = str(job["incident_unique_id"])
+            incident = store.incident(incident_id)
+            if not incident:
+                store.finish_job(int(job["id"]), "failed", error=f"missing incident {incident_id}")
+                continue
+            workspace = Path(job.get("workspace_path") or drua_fix_workspace_for(config, incident)[0])
+            branch_name = str(job.get("branch_name") or drua_fix_workspace_for(config, incident)[1])
+            log_path = config.state_dir / "logs" / f"incident-{incident_id}-drua-fix-{job['attempts']}.md"
+            run_id = store.begin_run("drua-fix-worker", log_path)
+            try:
+                prepare_fix_workspace(config, workspace, branch_name)
+                proc = run_codex(
+                    config,
+                    drua_fix_prompt(incident, workspace, branch_name, config.lana_bank_dir),
+                    log_path,
+                    cwd=workspace,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"codex exited with {proc.returncode}")
+                payload = extract_json(proc.stdout)
+                if not isinstance(payload, dict):
+                    raise ValueError("Expected JSON object from Drua fix Codex run")
+                status = str(payload.get("status") or "needs_human")
+                commits = payload.get("commits") if isinstance(payload.get("commits"), list) else []
+                workflow_state = "drua_fix_succeeded" if status == "fixed" else f"drua_fix_{status}"
+                store.update_drua_workflow(
+                    incident_id,
+                    workflow_state,
+                    summary=str(payload.get("summary") or ""),
+                    log_path=log_path,
+                    fix_workspace=str(workspace),
+                    fix_branch=branch_name,
+                    fix_commits=[str(commit) for commit in commits],
+                    fix_update=True,
+                )
+                store.finish_job(
+                    int(job["id"]),
+                    "done" if status == "fixed" else "review_required",
+                    result=payload,
+                    log_path=log_path,
+                    workspace_path=str(workspace),
+                    branch_name=branch_name,
+                )
+                store.finish_run(run_id, True)
+                refresh_status_from_disk(config, store)
+                processed += 1
+            except Exception as exc:
+                store.finish_job(int(job["id"]), "failed", error=str(exc), log_path=log_path)
+                store.update_drua_workflow(
+                    incident_id,
+                    "drua_fix_failed",
+                    summary=str(exc),
+                    log_path=log_path,
+                    fix_workspace=str(workspace),
+                    fix_branch=branch_name,
+                    fix_update=True,
+                )
+                store.finish_run(run_id, False, str(exc))
+                refresh_status_from_disk(config, store)
+                print(f"Drua fix worker failed for {incident_id}: {exc}", file=sys.stderr)
+                return 1
+            if once:
+                break
+        print(json.dumps({"drua_fix_processed": processed}, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def do_enqueue_triage(config: MonitorConfig, incident_ref: str, force: bool = False) -> int:
+    store = Store(config.state_dir)
+    try:
+        incident = store.resolve_incident_ref(incident_ref)
+        if not incident:
+            print(
+                f"incident {incident_ref} is not in local state; run poll first",
+                file=sys.stderr,
+            )
+            return 1
+        unique_id = str(incident["unique_id"])
+        queued = store.enqueue_job(unique_id, "triage", config.triage_max_attempts, reset=force)
+        if queued:
+            store.update_incident_workflow(unique_id, "triage_pending")
+            refresh_status_from_disk(config, store)
+        print(json.dumps({"incident": unique_id, "queued": queued}, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def do_enqueue_fix(config: MonitorConfig, incident_ref: str, force: bool = False) -> int:
+    store = Store(config.state_dir)
+    try:
+        incident = store.resolve_incident_ref(incident_ref)
+        if not incident:
+            print(
+                f"incident {incident_ref} is not in local state; run poll first",
+                file=sys.stderr,
+            )
+            return 1
+        workspace, branch = fix_workspace_for(config, incident)
+        unique_id = str(incident["unique_id"])
+        queued = store.enqueue_job(
+            unique_id,
+            "fix",
+            config.fix_max_attempts,
+            workspace_path=str(workspace),
+            branch_name=branch,
+            reset=force,
+        )
+        if queued:
+            store.update_incident_workflow(
+                unique_id,
+                "fix_pending",
+                fix_workspace=str(workspace),
+                fix_branch=branch,
+            )
+            refresh_status_from_disk(config, store)
+        print(
+            json.dumps(
+                {
+                    "incident": unique_id,
+                    "queued": queued,
+                    "workspace": str(workspace),
+                    "branch": branch,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    finally:
+        store.close()
+
+
+def do_enqueue_drua_triage(config: MonitorConfig, incident_ref: str, force: bool = False) -> int:
+    store = Store(config.state_dir)
+    try:
+        incident = store.resolve_incident_ref(incident_ref)
+        if not incident:
+            print(
+                f"incident {incident_ref} is not in local state; run poll first",
+                file=sys.stderr,
+            )
+            return 1
+        unique_id = str(incident["unique_id"])
+        queued = store.enqueue_job(unique_id, "drua_triage", config.triage_max_attempts, reset=force)
+        if queued:
+            store.update_drua_workflow(unique_id, "drua_triage_pending")
+            refresh_status_from_disk(config, store)
+        print(json.dumps({"incident": unique_id, "queued": queued}, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
+def do_enqueue_drua_fix(config: MonitorConfig, incident_ref: str, force: bool = False) -> int:
+    store = Store(config.state_dir)
+    try:
+        incident = store.resolve_incident_ref(incident_ref)
+        if not incident:
+            print(
+                f"incident {incident_ref} is not in local state; run poll first",
+                file=sys.stderr,
+            )
+            return 1
+        workspace, branch = drua_fix_workspace_for(config, incident)
+        unique_id = str(incident["unique_id"])
+        queued = store.enqueue_job(
+            unique_id,
+            "drua_fix",
+            config.fix_max_attempts,
+            workspace_path=str(workspace),
+            branch_name=branch,
+            reset=force,
+        )
+        if queued:
+            store.update_drua_workflow(
+                unique_id,
+                "drua_fix_pending",
+                fix_workspace=str(workspace),
+                fix_branch=branch,
+                fix_update=True,
+            )
+            refresh_status_from_disk(config, store)
+        print(
+            json.dumps(
+                {
+                    "incident": unique_id,
+                    "queued": queued,
+                    "workspace": str(workspace),
+                    "branch": branch,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    finally:
+        store.close()
+
+
+def do_worker(config: MonitorConfig) -> int:
+    while True:
+        triage_rc = do_work_triage(config, once=True)
+        fix_rc = do_work_fixes(config, once=True)
+        drua_triage_rc = do_work_drua_triage(config, once=True)
+        drua_fix_rc = do_work_drua_fixes(config, once=True)
+        if triage_rc or fix_rc or drua_triage_rc or drua_fix_rc:
+            return triage_rc or fix_rc or drua_triage_rc or drua_fix_rc
+        time.sleep(30)
 
 
 def do_daemon(config: MonitorConfig) -> int:
@@ -1620,6 +2924,31 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("poll")
     sub.add_parser("daemon")
+    work_triage = sub.add_parser("work-triage")
+    work_triage.add_argument("--loop", action="store_true")
+    work_triage.add_argument("--limit", type=int)
+    work_fixes = sub.add_parser("work-fixes")
+    work_fixes.add_argument("--loop", action="store_true")
+    work_fixes.add_argument("--limit", type=int)
+    work_drua_triage = sub.add_parser("work-drua-triage")
+    work_drua_triage.add_argument("--loop", action="store_true")
+    work_drua_triage.add_argument("--limit", type=int)
+    work_drua_fixes = sub.add_parser("work-drua-fixes")
+    work_drua_fixes.add_argument("--loop", action="store_true")
+    work_drua_fixes.add_argument("--limit", type=int)
+    enqueue_triage = sub.add_parser("enqueue-triage")
+    enqueue_triage.add_argument("incident")
+    enqueue_triage.add_argument("--force", action="store_true")
+    enqueue_fix = sub.add_parser("enqueue-fix")
+    enqueue_fix.add_argument("incident")
+    enqueue_fix.add_argument("--force", action="store_true")
+    enqueue_drua_triage = sub.add_parser("enqueue-drua-triage")
+    enqueue_drua_triage.add_argument("incident")
+    enqueue_drua_triage.add_argument("--force", action="store_true")
+    enqueue_drua_fix = sub.add_parser("enqueue-drua-fix")
+    enqueue_drua_fix.add_argument("incident")
+    enqueue_drua_fix.add_argument("--force", action="store_true")
+    sub.add_parser("worker")
     snooze = sub.add_parser("snooze-concourse")
     snooze.add_argument("--minutes", type=int, default=60)
     sub.add_parser("unsnooze-concourse")
@@ -1634,6 +2963,40 @@ def main(argv: list[str] | None = None) -> int:
         return do_poll(config)
     if args.command == "daemon":
         return do_daemon(config)
+    if args.command == "work-triage":
+        return do_work_triage(
+            config,
+            once=not args.loop and (args.limit is None or args.limit <= 1),
+            limit=args.limit,
+        )
+    if args.command == "work-fixes":
+        return do_work_fixes(
+            config,
+            once=not args.loop and (args.limit is None or args.limit <= 1),
+            limit=args.limit,
+        )
+    if args.command == "work-drua-triage":
+        return do_work_drua_triage(
+            config,
+            once=not args.loop and (args.limit is None or args.limit <= 1),
+            limit=args.limit,
+        )
+    if args.command == "work-drua-fixes":
+        return do_work_drua_fixes(
+            config,
+            once=not args.loop and (args.limit is None or args.limit <= 1),
+            limit=args.limit,
+        )
+    if args.command == "enqueue-triage":
+        return do_enqueue_triage(config, args.incident, force=args.force)
+    if args.command == "enqueue-fix":
+        return do_enqueue_fix(config, args.incident, force=args.force)
+    if args.command == "enqueue-drua-triage":
+        return do_enqueue_drua_triage(config, args.incident, force=args.force)
+    if args.command == "enqueue-drua-fix":
+        return do_enqueue_drua_fix(config, args.incident, force=args.force)
+    if args.command == "worker":
+        return do_worker(config)
     if args.command == "snooze-concourse":
         return do_snooze_concourse(config, args.minutes)
     if args.command == "unsnooze-concourse":

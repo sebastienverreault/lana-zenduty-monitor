@@ -318,11 +318,25 @@ class LanaZendutyIndicator extends PanelMenu.Button {
         const schedule = status.schedule || {};
         const scheduleState = this._scheduleState(schedule);
         const scheduleText = this._scheduleText(schedule);
+        const workflowBits = [];
+        if (counts.triage_pending || counts.triage_running)
+            workflowBits.push(`triage ${counts.triage_running || 0}/${counts.triage_pending || 0}`);
+        if (counts.bug_possible || counts.fix_running)
+            workflowBits.push(`bugs ${counts.bug_possible || 0}`);
+        if (counts.review_required)
+            workflowBits.push(`review ${counts.review_required}`);
+        if (counts.drua_triage_pending || counts.drua_triage_running)
+            workflowBits.push(`drua triage ${counts.drua_triage_running || 0}/${counts.drua_triage_pending || 0}`);
+        if (counts.drua_fix_pending || counts.drua_fix_running)
+            workflowBits.push(`drua fix ${counts.drua_fix_running || 0}/${counts.drua_fix_pending || 0}`);
+        if (counts.drua_fix_succeeded)
+            workflowBits.push(`drua fixed ${counts.drua_fix_succeeded}`);
+        const workflowText = workflowBits.length ? ` · ${workflowBits.join(' · ')}` : '';
 
         this._setIconColor(color);
 
         this._summaryItem.label.text =
-            `Zenduty: ${triggered} triggered · ${acknowledged} acknowledged · Schedule: ${scheduleState}`;
+            `Zenduty: ${triggered} triggered · ${acknowledged} acknowledged · Schedule: ${scheduleState}${workflowText}`;
         this._summaryItem.label.style = this._stateStyle(color);
         this._scheduleItem.label.text = scheduleText;
         this._scheduleItem.label.style = this._stateStyle(this._scheduleColor(schedule));
@@ -360,6 +374,22 @@ class LanaZendutyIndicator extends PanelMenu.Button {
                     `  created ${created} · triage ${triage}`,
                     {reactive: false}
                 ));
+            }
+        }
+        const tracked = status.tracked_incidents || [];
+        if (tracked.length > 0) {
+            this._incidentSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            this._incidentSection.addMenuItem(this._wrappedMenuItem('Workflow history', 'gray'));
+            for (const incident of tracked.slice(0, 6)) {
+                const number = incident.incident_number || '?';
+                const state = incident.workflow_state || 'pending';
+                const druaState = incident.drua_workflow_state ? ` · drua ${incident.drua_workflow_state}` : '';
+                const classification = incident.classification ? ` · ${incident.classification}` : '';
+                const row = new PopupMenu.PopupMenuItem(`#${number} ${state}${classification}${druaState}`);
+                row.connect('activate', () => {
+                    this._openPath(incident.fix_workspace || incident.drua_fix_workspace || incident.triage_log_path || incident.drua_triage_log_path || this._detailsPath);
+                });
+                this._incidentSection.addMenuItem(row);
             }
         }
 

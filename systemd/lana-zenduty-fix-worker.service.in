@@ -1,0 +1,13 @@
+[Unit]
+Description=LANA Zenduty fix worker
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_DIR@
+ExecStart=/usr/bin/env zsh -lc 'cd @REPO_DIR@ && set -a; [ ! -f .env ] || source .env; set +a; python3 -m lana_zenduty_monitor work-fixes --loop'
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

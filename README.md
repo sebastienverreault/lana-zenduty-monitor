@@ -85,7 +85,8 @@ Runtime files live in `~/.local/state/lana-zenduty-monitor/`:
 - `monitor.db`: incident and run state
 - `status.json`: current state for the GNOME extension
 - `details.html`: local details UI opened from the GNOME extension
-- `logs/`: Codex poll and triage transcripts
+- `logs/`: Codex poll, triage, and fix transcripts
+- `fixes/`: per-incident local workspaces for bug-fix attempts
 
 ## Commands
 
@@ -93,11 +94,19 @@ Runtime files live in `~/.local/state/lana-zenduty-monitor/`:
 make poll
 make daemon
 make triage INCIDENT_ID=<zenduty-unique-id>
+make enqueue-triage INCIDENT=<zenduty-unique-id-or-number>
+make work-triage
+make enqueue-fix INCIDENT=<zenduty-unique-id-or-number>
+make work-fixes
+make enqueue-drua-triage INCIDENT=<zenduty-unique-id-or-number>
+make work-drua-triage
+make enqueue-drua-fix INCIDENT=<zenduty-unique-id-or-number>
+make work-drua-fixes
 make status
 make details
 ```
 
-`make poll` asks Codex to use Drua from the Lana Bank checkout and return machine-readable JSON. Newly seen incidents are stored and optionally triaged.
+`make poll` asks Codex to use Drua from the Lana Bank checkout and return machine-readable JSON. Newly seen triggered incidents are stored and queued for triage when auto-triage is enabled.
 
 `make poll` also checks open Dependabot PRs with the local `gh` CLI and records how many have successful checks.
 
@@ -105,7 +114,13 @@ For Zenduty incidents whose title starts with `[HoneyComb]`, `make poll` fetches
 
 For Concourse, `make poll` uses `concourse_list_pipelines`, `concourse_list_jobs`, `concourse_get_build_status`, `concourse_get_build_resources`, and `concourse_get_build_logs`.
 
-`make triage` asks Codex to use the `lana-alert-fixer` workflow, inspect Zenduty/Honeycomb/code, and write a summary. The default prompt forbids auto-resolution.
+`make work-triage` processes one queued triage job. A triage worker writes a Zenduty note tagged `[lana-monitor:triage]`, optionally acknowledges the incident, classifies it as `false_positive`, `bug_possible`, or `needs_human`, and never resolves it. False positives are marked for review instead of being closed.
+
+`make work-fixes` processes one queued bug-fix job. A fix worker creates an incident-specific workspace under `fix_root_dir`, works on a branch named for the incident, records reproduction and fix evidence, commits local fixes when it makes code changes, and writes a Zenduty note tagged `[lana-monitor:fix]`. It does not push or resolve incidents.
+
+`make enqueue-triage` and `make enqueue-fix` manually queue jobs by Zenduty unique id or by incident number if the incident is already in local state. Pass `ARGS=--force` to retry an existing job.
+
+When `monitor.drua_shadow_enabled` is true, each newly triggered incident is also queued for a Drua shadow triage job in parallel with the normal worker. Shadow jobs may use read-only Drua tools but do not write Zenduty notes or change incident status. They record the would-have-written note, classification, evidence, and any debug/fix result locally for comparison. If `monitor.auto_drua_debug_bug_possible` is true, `bug_possible` shadow triage results queue a shadow fix job under `fix_root_dir/drua-shadow/`.
 
 ## Details UI
 
@@ -117,6 +132,7 @@ The GNOME extension popup shows current counts, schedule state, up to eight open
 - `Refresh now`: starts the systemd user service once
 
 Incident rows open their triage log when available, otherwise the details page.
+Workflow history rows open the fix workspace when available, otherwise the triage log or details page.
 
 ## systemd User Timer
 
@@ -124,9 +140,13 @@ Incident rows open their triage log when available, otherwise the details page.
 make enable-user-service
 systemctl --user status lana-zenduty-monitor.timer
 journalctl --user -u lana-zenduty-monitor.service -f
+journalctl --user -u lana-zenduty-triage-worker.service -f
+journalctl --user -u lana-zenduty-fix-worker.service -f
+journalctl --user -u lana-zenduty-drua-triage-worker.service -f
+journalctl --user -u lana-zenduty-drua-fix-worker.service -f
 ```
 
-The timer runs `poll` periodically. The interval is controlled by `systemd/lana-zenduty-monitor.timer`; the monitor also has its own daemon mode if you prefer a foreground loop.
+The timer runs `poll` periodically. Queue workers run as long-lived user services and process triage and fix jobs independently from polling. The interval is controlled by `systemd/lana-zenduty-monitor.timer`; the monitor also has its own daemon mode if you prefer a foreground loop.
 
 ## GNOME Extension
 
